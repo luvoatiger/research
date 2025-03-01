@@ -7,31 +7,9 @@ https://www.ecmwf.int/en/elibrary/10829-predictability-problem-partly-solved
 import numpy as np
 from numba import jit, njit
 import matplotlib.pyplot as plt
-import os
-
-@njit
-def L96_eq1_xdot(X, F, advect=True):
-    """
-    Calculate the time rate of change for the X variables for the Lorenz '96, equation 1:
-        d/dt X[k] = -X[k-2] X[k-1] + X[k-1] X[k+1] - X[k] + F
-
-    Args:
-        X : Values of X variables at the current time step
-        F : Forcing term
-    Returns:
-        dXdt : Array of X time tendencies
-    """
-
-    K = len(X)
-    Xdot = np.zeros(K)
-
-    if advect:
-        Xdot = np.roll(X, 1) * (np.roll(X, -1) - np.roll(X, 2)) - X + F
-    else:
-        Xdot = -X + F
-
-    return Xdot
-
+from typing import Tuple
+from tqdm import tqdm
+from statsmodels.tsa.stattools import acf
 
 @njit
 def L96_2t_xdot_ydot(X, Y, F, h, b, c):
@@ -51,6 +29,7 @@ def L96_2t_xdot_ydot(X, Y, F, h, b, c):
     Returns:
         dXdt, dYdt, C : Arrays of X and Y time tendencies, and the coupling term -hc/b*sum(Y,j)
     """
+
     JK, K = len(Y), len(X)
     J = JK // K
     assert JK == J * K, "X and Y have incompatible shapes"
@@ -68,192 +47,48 @@ def L96_2t_xdot_ydot(X, Y, F, h, b, c):
 
     return Xdot, Ydot, -hcb * Ysummed
 
-
 # Time-stepping methods ##########################################################################################
-def EulerFwd(fn, dt, X, *params):
-    """
-    Calculate the new state X(n+1) for d/dt X = fn(X,t,F) using the Euler forward method.
+def RK4(
+    X: np.ndarray, 
+    Y: np.ndarray, 
+    dt: float, 
+    F: float, 
+    h: float, 
+    b: float, 
+    c: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """단일 RK4 스텝을 수행합니다.
 
     Args:
-        fn : The function returning the time rate of change of model variables X
-        dt : The time step
-        X  : Values of X variables at the current time, t
-        params : All other arguments that should be passed to fn, i.e. fn(X, t, *params)
+        X: X 변수의 현재 상태
+        Y: Y 변수의 현재 상태
+        dt: 시간 간격
+        F: 외력 항
+        h: 결합 계수
+        b: 진폭 비율
+        c: 시간 스케일 비율
 
     Returns:
-        X at t+dt
+        Tuple[np.ndarray, np.ndarray, np.ndarray]: 새로운 X 상태, Y 상태, 그리고 결합항
     """
-
-    return X + dt * fn(X, *params)
-
-
-def RK2(fn, dt, X, *params):
-    """
-    Calculate the new state X(n+1) for d/dt X = fn(X,t,F) using the second order Runge-Kutta method.
-
-    Args:
-        fn : The function returning the time rate of change of model variables X
-        dt : The time step
-        X  : Values of X variables at the current time, t
-        params : All other arguments that should be passed to fn, i.e. fn(X, t, *params)
-
-    Returns:
-        X at t+dt
-    """
-
-    X1 = X + 0.5 * dt * fn(X, *params)
-    return X + dt * fn(X1, *params)
-
-
-def RK4(fn, dt, X, *params):
-    """
-    Calculate the new state X(n+1) for d/dt X = fn(X,t,...) using the fourth order Runge-Kutta method.
-
-    Args:
-        fn     : The function returning the time rate of change of model variables X
-        dt     : The time step
-        X      : Values of X variables at the current time, t
-        params : All other arguments that should be passed to fn, i.e. fn(X, t, *params)
-
-    Returns:
-        X at t+dt
-    """
-
-    Xdot1 = fn(X, *params)
-    Xdot2 = fn(X + 0.5 * dt * Xdot1, *params)
-    Xdot3 = fn(X + 0.5 * dt * Xdot2, *params)
-    Xdot4 = fn(X + dt * Xdot3, *params)
-    return X + (dt / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-
-
-def RK4_adaptive(fn, dt, X, tol=1e-6, dt_min=1e-6, dt_max=0.1, safety=0.9, *params):
-    """
-    Calculate the new state X(n+1) for d/dt X = fn(X,t,...) using the adaptive fourth order Runge-Kutta method.
+    k1x, k1y, XYtend = L96_2t_xdot_ydot(X, Y, F, h, b, c)
+    k2x, k2y, _ = L96_2t_xdot_ydot(
+        X + 0.5 * dt * k1x, Y + 0.5 * dt * k1y, F, h, b, c
+    )
+    k3x, k3y, _ = L96_2t_xdot_ydot(
+        X + 0.5 * dt * k2x, Y + 0.5 * dt * k2y, F, h, b, c
+    )
+    k4x, k4y, _ = L96_2t_xdot_ydot(
+        X + dt * k3x, Y + dt * k3y, F, h, b, c
+    )
     
-    Args:
-        fn     : The function returning the time rate of change of model variables X
-        dt     : The initial time step
-        X      : Values of X variables at the current time, t
-        tol    : Error tolerance for step size adjustment
-        dt_min : Minimum allowed time step
-        dt_max : Maximum allowed time step
-        safety : Safety factor for step size adjustment (0 < safety < 1)
-        params : All other arguments that should be passed to fn, i.e. fn(X, t, *params)
+    X_new = X + (dt / 6.0) * ((k1x + k4x) + 2.0 * (k2x + k3x))
+    Y_new = Y + (dt / 6.0) * ((k1y + k4y) + 2.0 * (k2y + k3y))
     
-    Returns:
-        X at t+dt, actual dt used
-    """
-    # First try with full step
-    Xdot1 = fn(X, *params)
-    Xdot2 = fn(X + 0.5 * dt * Xdot1, *params)
-    Xdot3 = fn(X + 0.5 * dt * Xdot2, *params)
-    Xdot4 = fn(X + dt * Xdot3, *params)
-    X_full = X + (dt / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-    
-    # Now try with two half steps
-    dt_half = dt / 2.0
-    # First half step
-    Xdot1 = fn(X, *params)
-    Xdot2 = fn(X + 0.5 * dt_half * Xdot1, *params)
-    Xdot3 = fn(X + 0.5 * dt_half * Xdot2, *params)
-    Xdot4 = fn(X + dt_half * Xdot3, *params)
-    X_half = X + (dt_half / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-    
-    # Second half step
-    Xdot1 = fn(X_half, *params)
-    Xdot2 = fn(X_half + 0.5 * dt_half * Xdot1, *params)
-    Xdot3 = fn(X_half + 0.5 * dt_half * Xdot2, *params)
-    Xdot4 = fn(X_half + dt_half * Xdot3, *params)
-    X_half = X_half + (dt_half / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-    
-    # Estimate error
-    error = np.max(np.abs(X_full - X_half))
-    
-    # Adjust step size based on error
-    if error > 0:
-        dt_optimal = safety * dt * (tol / error) ** 0.2
-    else:
-        dt_optimal = dt_max
-    
-    dt_optimal = min(max(dt_optimal, dt_min), dt_max)
-    
-    # If error is acceptable, return result, otherwise retry with adjusted step
-    if error <= tol:
-        return X_half, dt  # Return the more accurate result (two half steps)
-    else:
-        return RK4_adaptive(fn, dt_optimal, X, tol, dt_min, dt_max, safety, *params)
+    return X_new, Y_new, XYtend
 
 
 # Model integrators #############################################################################################
-# @jit(forceobj=True)
-def integrate_L96_1t(X0, F, dt, nt, method=RK4, t0=0):
-    """
-    Integrates forward-in-time the single time-scale Lorenz 1996 model, using the integration "method".
-    Returns the full history with nt+1 values starting with initial conditions, X[:,0]=X0, and ending
-    with the final state, X[:,nt+1] at time t0+nt*dt.
-
-    Args:
-        X0     : Values of X variables at the current time
-        F      : Forcing term
-        dt     : The time step
-        nt     : Number of forwards steps
-        method : The time-stepping method that returns X(n+1) given X(n)
-        t0     : Initial time (defaults to 0)
-
-    Returns:
-        X[:,:], time[:] : the full history X[n,k] at times t[n]
-
-    Example usage:
-        X,t = integrate_L96_1t(5+5*np.random.rand(8), 18, 0.01, 500)
-        plt.plot(t, X);
-    """
-
-    time, hist = t0 + np.zeros((nt + 1)), np.zeros((nt + 1, len(X0)))
-    X = X0.copy()
-    hist[0, :] = X
-    for n in range(nt):
-        X = method(L96_eq1_xdot, dt, X, F)
-        hist[n + 1], time[n + 1] = X, t0 + dt * (n + 1)
-    return hist, time
-
-
-# @jit(forceobj=True)
-def integrate_L96_2t(X0, Y0, si, nt, F, h, b, c, t0=0, dt=0.001):
-    """
-    Integrates forward-in-time the two time-scale Lorenz 1996 model, using the RK4 integration method.
-    Returns the full history with nt+1 values starting with initial conditions, X[:,0]=X0 and Y[:,0]=Y0,
-    and ending with the final state, X[:,nt+1] and Y[:,nt+1] at time t0+nt*si.
-
-    Note the model is intergrated
-
-    Args:
-        X0 : Values of X variables at the current time
-        Y0 : Values of Y variables at the current time
-        si : Sampling time interval
-        nt : Number of sample segments (results in nt+1 samples incl. initial state)
-        F  : Forcing term
-        h  : coupling coefficient
-        b  : ratio of amplitudes
-        c  : time-scale ratio
-        t0 : Initial time (defaults to 0)
-        dt : The actual time step. If dt<si, then si is used. Otherwise si/dt must be a whole number. Default 0.001.
-
-    Returns:
-        X[:,:], Y[:,:], time[:] : the full history X[n,k] and Y[n,k] at times t[n]
-
-    Example usage:
-        X,Y,t = integrate_L96_2t(5+5*np.random.rand(8), np.random.rand(8*4), 0.01, 500, 18, 1, 10, 10)
-        plt.plot( t, X);
-    """
-
-    xhist, yhist, time, _ = integrate_L96_2t_with_coupling(
-        X0, Y0, si, nt, F, h, b, c, t0=t0, dt=dt
-    )
-
-    return xhist, yhist, time
-
-
-# @jit(forceobj=True)
 def integrate_L96_2t_with_coupling(X0, Y0, si, nt, F, h, b, c, t0=0, dt=0.001):
     """
     Integrates forward-in-time the two time-scale Lorenz 1996 model, using the RK4 integration method.
@@ -302,19 +137,7 @@ def integrate_L96_2t_with_coupling(X0, Y0, si, nt, F, h, b, c, t0=0, dt=0.001):
 
     for n in range(nt):
         for s in range(ns):
-            # RK4 update of X,Y
-            Xdot1, Ydot1, XYtend = L96_2t_xdot_ydot(X, Y, F, h, b, c)
-            Xdot2, Ydot2, _ = L96_2t_xdot_ydot(
-                X + 0.5 * dt * Xdot1, Y + 0.5 * dt * Ydot1, F, h, b, c
-            )
-            Xdot3, Ydot3, _ = L96_2t_xdot_ydot(
-                X + 0.5 * dt * Xdot2, Y + 0.5 * dt * Ydot2, F, h, b, c
-            )
-            Xdot4, Ydot4, _ = L96_2t_xdot_ydot(
-                X + dt * Xdot3, Y + dt * Ydot3, F, h, b, c
-            )
-            X = X + (dt / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-            Y = Y + (dt / 6.0) * ((Ydot1 + Ydot4) + 2.0 * (Ydot2 + Ydot3))
+            X, Y, XYtend = RK4(X, Y, dt, F, h, b, c)
 
         xhist[n + 1], yhist[n + 1], time[n + 1], xytend_hist[n + 1] = (
             X,
@@ -325,497 +148,407 @@ def integrate_L96_2t_with_coupling(X0, Y0, si, nt, F, h, b, c, t0=0, dt=0.001):
     return xhist, yhist, time, xytend_hist
 
 
-def integrate_L96_1t_adaptive(X0, F, dt_init, nt, tol=1e-6, dt_min=1e-6, dt_max=0.1, t0=0):
-    """
-    Integrates forward-in-time the single time-scale Lorenz 1996 model, using the adaptive RK4 method.
-    Returns the full history with variable time steps.
-    
+# Adaptive Time-Stepping Model integrators #############################################################################################
+def calculate_normalized_error(
+    X_full: np.ndarray, 
+    Y_full: np.ndarray,
+    X_half: np.ndarray, 
+    Y_half: np.ndarray
+) -> float:
+    """정규화된 오차를 계산합니다.
+
     Args:
-        X0      : Values of X variables at the current time
-        F       : Forcing term
-        dt_init : The initial time step
-        nt      : Maximum number of forwards steps
-        tol     : Error tolerance for step size adjustment
-        dt_min  : Minimum allowed time step
-        dt_max  : Maximum allowed time step
-        t0      : Initial time (defaults to 0)
-    
+        X_full: 전체 스텝으로 계산된 X
+        Y_full: 전체 스텝으로 계산된 Y
+        X_half: 절반 스텝으로 계산된 X
+        Y_half: 절반 스텝으로 계산된 Y
+
     Returns:
-        X[:,:], time[:] : the full history X[n,k] at times t[n]
-    
-    Example usage:
-        X,t = integrate_L96_1t_adaptive(5+5*np.random.rand(8), 18, 0.01, 500)
-        plt.plot(t, X);
+        float: 정규화된 최대 상대 오차
     """
-    
-    time, hist = [t0], [X0.copy()]
-    X = X0.copy()
-    t = t0
-    dt = dt_init
-    
-    for n in range(nt):
-        X, dt_used = RK4_adaptive(L96_eq1_xdot, dt, X, tol, dt_min, dt_max, 0.9, F)
-        t += dt_used
-        hist.append(X.copy())
-        time.append(t)
-        dt = dt_used  # Use the adapted time step for next iteration
-    
-    return np.array(hist), np.array(time)
+    error_x = np.linalg.norm(X_full - X_half) / (np.linalg.norm(X_full) + 1e-15)
+    error_y = np.linalg.norm(Y_full - Y_half) / (np.linalg.norm(Y_full) + 1e-15)
+    return max(error_x, error_y)
 
 
-def integrate_L96_2t_adaptive(X0, Y0, dt_init, nt, F, h, b, c, tol=1e-6, dt_min=1e-6, dt_max=0.1, t0=0):
-    """
-    Integrates forward-in-time the two time-scale Lorenz 1996 model, using the adaptive RK4 method.
-    Returns the full history with variable time steps.
-    
+def adjust_timestep(
+    dt: float, 
+    error: float, 
+    tol: float, 
+    dt_max: float = 0.001, 
+    dt_min: float = 1e-6,
+    safety_factor: float = 0.9
+) -> float:
+    """오차에 기반하여 시간 간격을 조절합니다.
+
     Args:
-        X0      : Values of X variables at the current time
-        Y0      : Values of Y variables at the current time
-        dt_init : The initial time step
-        nt      : Maximum number of forwards steps
-        F       : Forcing term
-        h       : coupling coefficient
-        b       : ratio of amplitudes
-        c       : time-scale ratio
-        tol     : Error tolerance for step size adjustment
-        dt_min  : Minimum allowed time step
-        dt_max  : Maximum allowed time step
-        t0      : Initial time (defaults to 0)
-    
+        dt: 현재 시간 간격
+        error: 계산된 오차
+        tol: 허용 오차
+        dt_max: 최대 허용 시간 간격 (기본값: 0.001)
+        dt_min: 최소 허용 시간 간격 (기본값: 1e-6)
+        safety_factor: 안전 계수 (기본값: 0.9)
+
     Returns:
-        X[:,:], Y[:,:], time[:], C[:,:] : the full history X[n,k], Y[n,k] at times t[n], and coupling term
-    
-    Example usage:
-        X,Y,t,C = integrate_L96_2t_adaptive(5+5*np.random.rand(8), np.random.rand(8*4), 0.01, 500, 18, 1, 10, 10)
-        plt.plot(t, X);
+        float: 조절된 새로운 시간 간격
     """
+    if error < tol:
+        # PI 제어기 기반 시간 간격 증가
+        dt_new = dt * min(2.0, safety_factor * (tol/error)**0.2)
+        return min(dt_max, dt_new)
+    else:
+        # PI 제어기 기반 시간 간격 감소
+        dt_new = dt * max(0.1, safety_factor * (tol/error)**0.25)
+        return max(dt_min, dt_new)
+
+
+def adaptive_integrate_L96_2t_with_coupling(
+    X0: np.ndarray,
+    Y0: np.ndarray,
+    si: float,
+    nt: int,
+    F: float,
+    h: float,
+    b: float,
+    c: float,
+    t0: float = 0,
+    dt: float = 0.001,
+    tol: float = 1e-6
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """적응형 RK4 방법을 사용하여 Lorenz 96 two-timescale 모델을 적분합니다.
+
+    Args:
+        X0: X 변수의 초기 조건
+        Y0: Y 변수의 초기 조건
+        si: 샘플링 간격
+        nt: 샘플링 횟수
+        F: 외력 항
+        h: 결합 계수
+        b: 진폭 비율
+        c: 시간 스케일 비율
+        t0: 초기 시간 (기본값: 0)
+        dt: 초기 시간 간격 (기본값: 0.001)
+        tol: 허용 오차 (기본값: 1e-6)
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: 
+            - X 변수의 시간 이력
+            - Y 변수의 시간 이력
+            - 시간 배열
+            - 결합항의 시간 이력
+    """
+    # 결과 저장을 위한 배열 초기화
+    time = t0 + np.zeros(nt + 1)
+    xhist = np.zeros((nt + 1, len(X0)))
+    yhist = np.zeros((nt + 1, len(Y0)))
+    xytend_hist = np.zeros((nt + 1, len(X0)))
     
-    time, xhist, yhist, xytend_hist = [t0], [X0.copy()], [Y0.copy()], [np.zeros(len(X0))]
+    # 초기 조건 저장
     X, Y = X0.copy(), Y0.copy()
-    t = t0
-    dt = dt_init
+    xhist[0], yhist[0] = X, Y
+    time[0] = t0
+    xytend_hist[0] = 0
+    current_time = t0
     
     for n in range(nt):
-        # Adaptive RK4 for the coupled system
-        # First try with full step
-        Xdot1, Ydot1, XYtend = L96_2t_xdot_ydot(X, Y, F, h, b, c)
-        Xdot2, Ydot2, _ = L96_2t_xdot_ydot(X + 0.5 * dt * Xdot1, Y + 0.5 * dt * Ydot1, F, h, b, c)
-        Xdot3, Ydot3, _ = L96_2t_xdot_ydot(X + 0.5 * dt * Xdot2, Y + 0.5 * dt * Ydot2, F, h, b, c)
-        Xdot4, Ydot4, _ = L96_2t_xdot_ydot(X + dt * Xdot3, Y + dt * Ydot3, F, h, b, c)
-        X_full = X + (dt / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-        Y_full = Y + (dt / 6.0) * ((Ydot1 + Ydot4) + 2.0 * (Ydot2 + Ydot3))
+        target_time = t0 + (n + 1) * si
         
-        # Now try with two half steps
-        dt_half = dt / 2.0
-        # First half step
-        Xdot1, Ydot1, _ = L96_2t_xdot_ydot(X, Y, F, h, b, c)
-        Xdot2, Ydot2, _ = L96_2t_xdot_ydot(X + 0.5 * dt_half * Xdot1, Y + 0.5 * dt_half * Ydot1, F, h, b, c)
-        Xdot3, Ydot3, _ = L96_2t_xdot_ydot(X + 0.5 * dt_half * Xdot2, Y + 0.5 * dt_half * Ydot2, F, h, b, c)
-        Xdot4, Ydot4, _ = L96_2t_xdot_ydot(X + dt_half * Xdot3, Y + dt_half * Ydot3, F, h, b, c)
-        X_half = X + (dt_half / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-        Y_half = Y + (dt_half / 6.0) * ((Ydot1 + Ydot4) + 2.0 * (Ydot2 + Ydot3))
+        while current_time < target_time:
+            # 남은 시간이 dt보다 작으면 조정
+            dt = min(dt, target_time - current_time)
+            
+            # 전체 스텝 계산
+            X_full, Y_full, XYtend = RK4(X, Y, dt, F, h, b, c)
+            
+            # 절반 스텝 계산
+            dt_half = dt / 2
+            X_mid, Y_mid, _ = RK4(X, Y, dt_half, F, h, b, c)
+            X_half, Y_half, _ = RK4(X_mid, Y_mid, dt_half, F, h, b, c)
+            
+            # 오차 계산
+            error = calculate_normalized_error(X_full, Y_full, X_half, Y_half)
+            
+            # 수치적 불안정성 검사
+            if np.any(np.isnan(X_full)) or np.any(np.isnan(Y_full)):
+                raise RuntimeError("수치적 불안정성 발생: NaN 값 감지")
+            
+            # 시간 간격 조절 및 결과 업데이트
+            new_dt = adjust_timestep(dt, error, tol)
+            
+            if error < tol:
+                X, Y = X_full, Y_full
+                current_time += dt
+                dt = new_dt
+            else:
+                dt = new_dt
+                continue
         
-        # Second half step
-        Xdot1, Ydot1, _ = L96_2t_xdot_ydot(X_half, Y_half, F, h, b, c)
-        Xdot2, Ydot2, _ = L96_2t_xdot_ydot(X_half + 0.5 * dt_half * Xdot1, Y_half + 0.5 * dt_half * Ydot1, F, h, b, c)
-        Xdot3, Ydot3, _ = L96_2t_xdot_ydot(X_half + 0.5 * dt_half * Xdot2, Y_half + 0.5 * dt_half * Ydot2, F, h, b, c)
-        Xdot4, Ydot4, _ = L96_2t_xdot_ydot(X_half + dt_half * Xdot3, Y_half + dt_half * Ydot3, F, h, b, c)
-        X_half = X_half + (dt_half / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-        Y_half = Y_half + (dt_half / 6.0) * ((Ydot1 + Ydot4) + 2.0 * (Ydot2 + Ydot3))
+        # 샘플링 시점의 결과 저장
+        xhist[n + 1] = X
+        yhist[n + 1] = Y
+        time[n + 1] = current_time
+        xytend_hist[n + 1] = XYtend
         
-        # Estimate error (use maximum of X and Y errors)
-        error_X = np.max(np.abs(X_full - X_half))
-        error_Y = np.max(np.abs(Y_full - Y_half))
-        error = max(error_X, error_Y)
-        
-        # Adjust step size based on error
-        if error > 0:
-            dt_optimal = 0.9 * dt * (tol / error) ** 0.2
-        else:
-            dt_optimal = dt_max
-        
-        dt_optimal = min(max(dt_optimal, dt_min), dt_max)
-        
-        # If error is acceptable, accept the step
-        if error <= tol:
-            X, Y = X_half, Y_half  # Use the more accurate result
-            t += dt
-            _, _, XYtend = L96_2t_xdot_ydot(X, Y, F, h, b, c)
-            xhist.append(X.copy())
-            yhist.append(Y.copy())
-            time.append(t)
-            xytend_hist.append(XYtend)
-            dt = dt_optimal  # Use the adapted time step for next iteration
-        else:
-            # Reject this step and try again with the adjusted step size
-            dt = dt_optimal
-            continue
-    
-    return np.array(xhist), np.array(yhist), np.array(time), np.array(xytend_hist)
+    return xhist, yhist, time, xytend_hist
 
 
-# Class for convenience
-class L96:
-    """
-    Class for two time-scale Lorenz 1996 model
-    """
-
-    X = "Current X state or initial conditions"
-    Y = "Current Y state or initial conditions"
-    F = "Forcing"
-    h = "Coupling coefficient"
-    b = "Ratio of timescales"
-    c = "Ratio of amplitudes"
-    dt = "Time step"
-
-    def __init__(self, K, J, F=18, h=1, b=10, c=10, t=0, dt=0.001):
-        """Construct a two time-scale model with parameters:
-        K  : Number of X values
-        J  : Number of Y values per X value
-        F  : Forcing term (default 18.)
-        h  : coupling coefficient (default 1.)
-        b  : ratio of amplitudes (default 10.)
-        c  : time-scale ratio (default 10.)
-        t  : Initial time (default 0.)
-        dt : Time step (default 0.001)
-        """
-        self.F, self.h, self.b, self.c, self.dt = F, h, b, c, dt
-        self.X, self.Y, self.t = b * np.random.randn(K), np.random.randn(J * K), t
-        self.K, self.J, self.JK = K, J, J * K  # For convenience
-        self.k, self.j = np.arange(self.K), np.arange(self.JK)  # For plotting
-
-    def __repr__(self):
-        return (
-            "L96: "
-            + "K="
-            + str(self.K)
-            + " J="
-            + str(self.J)
-            + " F="
-            + str(self.F)
-            + " h="
-            + str(self.h)
-            + " b="
-            + str(self.b)
-            + " c="
-            + str(self.c)
-            + " dt="
-            + str(self.dt)
-        )
-
-    def __str__(self):
-        return (
-            self.__repr__()
-            + "\n X="
-            + str(self.X)
-            + "\n Y="
-            + str(self.Y)
-            + "\n t="
-            + str(self.t)
-        )
-
-    def copy(self):
-        copy = L96(self.K, self.J, F=self.F, h=self.h, b=self.b, c=self.c, dt=self.dt)
-        copy.set_state(self.X, self.Y, t=self.t)
-        return copy
-
-    def print(self):
-        print(self)
-
-    def set_param(self, dt=None, F=None, h=None, b=None, c=None, t=None):
-        """Set a model parameter, e.g. .set_param(si=0.01, dt=0.002)"""
-        if dt is not None:
-            self.dt = dt
-        if F is not None:
-            self.F = F
-        if h is not None:
-            self.h = h
-        if b is not None:
-            self.b = b
-        if c is not None:
-            self.c = c
-        if t is not None:
-            self.t = t
-        return self
-
-    def set_state(self, X, Y, t=None):
-        """Set initial conditions (or current state), e.g. .set_state(X,Y)"""
-        self.X, self.Y = X, Y
-        if t is not None:
-            self.t = t
-        self.K, self.JK = self.X.size, self.Y.size  # For convenience
-        self.J = self.JK // self.K
-        self.k, self.j = np.arange(self.K), np.arange(self.JK)  # For plotting
-        return self
-
-    def randomize_IC(self):
-        """Randomize the initial conditions (or current state)"""
-        X, Y = self.b * np.random.rand(self.X.size), np.random.rand(self.Y.size)
-        return self.set_state(X, Y)
-
-    def run(self, si, T, store=False, return_coupling=False):
-        """Run model for a total time of T, sampling at intervals of si.
-        If store=Ture, then stores the final state as the initial conditions for the next segment.
-        If return_coupling=True, returns C in addition to X,Y,t.
-        Returns sampled history: X[:,:],Y[:,:],t[:],C[:,:]."""
-        nt = int(T / si)
-        X, Y, t, C = integrate_L96_2t_with_coupling(
-            self.X,
-            self.Y,
-            si,
-            nt,
-            self.F,
-            self.h,
-            self.b,
-            self.c,
-            t0=self.t,
-            dt=self.dt,
-        )
-        if store:
-            self.X, self.Y, self.t = X[-1], Y[-1], t[-1]
-        if return_coupling:
-            return X, Y, t, C
-        else:
-            return X, Y, t
-
-    def run_adaptive(self, T, tol=1e-6, dt_min=1e-6, dt_max=0.1, store=False, return_coupling=False):
-        """Run model for a total time of T using adaptive time stepping.
-        If store=True, then stores the final state as the initial conditions for the next segment.
-        If return_coupling=True, returns C in addition to X,Y,t.
-        Returns sampled history: X[:,:],Y[:,:],t[:],C[:,:]."""
-        nt = int(T / dt_min)  # Maximum number of steps (worst case)
-        X, Y, t, C = integrate_L96_2t_adaptive(
-            self.X,
-            self.Y,
-            self.dt,
-            nt,
-            self.F,
-            self.h,
-            self.b,
-            self.c,
-            tol=tol,
-            dt_min=dt_min,
-            dt_max=dt_max,
-            t0=self.t,
-        )
-        if store:
-            self.X, self.Y, self.t = X[-1], Y[-1], t[-1]
-        if return_coupling:
-            return X, Y, t, C
-        else:
-            return X, Y, t
-
-
-class L96s:
-    """
-    Class for single time-scale Lorenz 1996 model
-    """
-
-    X = None  # Current X state or initial conditions
-    F = None  # Forcing
-    dt = None  # Default time-step
-    method = None  # Integration method
-
-    def __init__(self, K, dt, F=18, method=EulerFwd, t=0):
-        """Construct a single time-scale model with parameters:
-        K      : Number of X values
-        dt     : time-step
-        F      : Forcing term
-        t      : Initial time
-        method : Integration method, e.g. EulerFwd, RK2, or RK4
-        """
-        self.F, self.dt = F, dt
-        self.method = method
-        self.X, self.t = F * np.random.randn(K), t
-        self.K = self.X.size  # For convenience
-        self.k = np.arange(self.K)  # For plotting
-
-    def __repr__(self):
-        return (
-            "L96: "
-            + "K="
-            + str(self.K)
-            + " F="
-            + str(self.F)
-            + " dt="
-            + str(self.dt)
-            + " method="
-            + str(self.method)
-        )
-
-    def __str__(self):
-        return self.__repr__() + "\n X=" + str(self.X) + "\n t=" + str(self.t)
-
-    def copy(self):
-        copy = L96s(self.K, self.dt, F=self.F, method=self.method)
-        copy.set_state(self.X, t=self.t)
-        return copy
-
-    def print(self):
-        print(self)
-
-    def set_param(self, dt=None, F=None, t=None, method=None):
-        """Set a model parameter, e.g. .set_param(dt=0.002)"""
-        if dt is not None:
-            self.dt = dt
-        if F is not None:
-            self.F = F
-        if t is not None:
-            self.t = t
-        if method is not None:
-            self.method = method
-        return self
-
-    def set_state(self, X, t=None):
-        """Set initial conditions (or current state), e.g. .set_state(X)"""
-        self.X = X
-        self.K = self.X.size  # For convenience
-        self.k = np.arange(self.K)  # For plotting
-        if t is not None:
-            self.t = t
-        return self
-
-    def randomize_IC(self):
-        """Randomize the initial conditions (or current state)"""
-        self.X = self.F * np.random.rand(self.X.size)
-        return self
-
-    def run(self, T, store=False):
-        """Run model for a total time of T.
-        If store=Ture, then stores the final state as the initial conditions for the next segment.
-        Returns full history: X[:,:],t[:]."""
-        nt = int(T / self.dt)
-        X, t = integrate_L96_1t(
-            self.X, self.F, self.dt, nt, method=self.method, t0=self.t
-        )
-        if store:
-            self.X, self.t = X[-1], t[-1]
-        return X, t
-
-    def run_adaptive(self, T, tol=1e-6, dt_min=1e-6, dt_max=0.1, store=False):
-        """Run model for a total time of T using adaptive time stepping.
-        If store=True, then stores the final state as the initial conditions for the next segment.
-        Returns full history: X[:,:],t[:]."""
-        nt = int(T / dt_min)  # Maximum number of steps (worst case)
-        X, t = integrate_L96_1t_adaptive(
-            self.X, 
-            self.F, 
-            self.dt, 
-            nt, 
-            tol=tol, 
-            dt_min=dt_min, 
-            dt_max=dt_max, 
-            t0=self.t
-        )
-        if store:
-            self.X, self.t = X[-1], t[-1]
-        return X, t
-    
 def s(k, K):
     """A non-dimension coordinate from -1..+1 corresponding to k=0..K"""
     return 2 * (0.5 + k) / K - 1
 
 
+# Class for convenience
+class L96:
+    """Two time-scale Lorenz 1996 model with adaptive time-stepping capability.
+    
+    Attributes:
+        X (np.ndarray): Current X state or initial conditions
+        Y (np.ndarray): Current Y state or initial conditions
+        F (float): Forcing term
+        h (float): Coupling coefficient
+        b (float): Ratio of amplitudes
+        c (float): Time-scale ratio
+        dt (float): Time step
+        K (int): Number of X values
+        J (int): Number of Y values per X value
+        JK (int): Total number of Y values (J * K)
+    """
+
+    def __init__(self, K: int, J: int, F: float = 18, h: float = 1, 
+                 b: float = 10, c: float = 10, t: float = 0, dt: float = 0.001):
+        """Construct a two time-scale model with parameters.
+
+        Args:
+            K: Number of X values
+            J: Number of Y values per X value
+            F: Forcing term (default 18.)
+            h: Coupling coefficient (default 1.)
+            b: Ratio of amplitudes (default 10.)
+            c: Time-scale ratio (default 10.)
+            t: Initial time (default 0.)
+            dt: Time step (default 0.001)
+        """
+        self.F, self.h, self.b, self.c, self.dt = F, h, b, c, dt
+        self.t = t
+        self.K, self.J = K, J
+        self.JK = J * K
+        
+        # Initialize states with random values
+        self.X = b * np.random.randn(K)
+        self.Y = np.random.randn(self.JK)
+        
+        # For plotting convenience
+        self.k = np.arange(self.K)
+        self.j = np.arange(self.JK)
+
+    def __repr__(self) -> str:
+        return (f"L96: K={self.K} J={self.J} F={self.F} h={self.h} "
+                f"b={self.b} c={self.c} dt={self.dt}")
+
+    def __str__(self) -> str:
+        return f"{self.__repr__()}\nX={self.X}\nY={self.Y}\nt={self.t}"
+
+    def copy(self):
+        """Create a deep copy of the current model instance."""
+        copy = L96(self.K, self.J, F=self.F, h=self.h, b=self.b, c=self.c, dt=self.dt)
+        copy.set_state(self.X.copy(), self.Y.copy(), t=self.t)
+        return copy
+
+    def set_param(self, **kwargs):
+        """Set model parameters.
+        
+        Args:
+            **kwargs: Parameters to update (dt, F, h, b, c, or t)
+        """
+        for key, value in kwargs.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+        return self
+
+    def set_state(self, X: np.ndarray, Y: np.ndarray, t: float = None):
+        """Set model state.
+        
+        Args:
+            X: New X state
+            Y: New Y state
+            t: New time value (optional)
+        """
+        self.X, self.Y = X, Y
+        if t is not None:
+            self.t = t
+        return self
+
+    def randomize_IC(self):
+        """Randomize the initial conditions."""
+        self.X = self.b * np.random.rand(self.K)
+        self.Y = np.random.rand(self.JK)
+        return self
+
+    def run(self, si: float, T: float, store: bool = False, 
+            return_coupling: bool = False, adaptive: bool = True, 
+            tol: float = 1e-6) -> tuple:
+        """Run model integration.
+        
+        Args:
+            si: Sampling interval
+            T: Total integration time
+            store: Whether to store final state
+            return_coupling: Whether to return coupling term
+            adaptive: Whether to use adaptive time-stepping
+            tol: Error tolerance for adaptive stepping
+            
+        Returns:
+            tuple: (X history, Y history, time points, [coupling term])
+        """
+        nt = int(T / si)
+        
+        if adaptive:
+            X, Y, t, C = adaptive_integrate_L96_2t_with_coupling(
+                self.X, self.Y, si, nt, self.F, self.h, self.b, self.c,
+                t0=self.t, dt=self.dt, tol=tol
+            )
+        else:
+            X, Y, t, C = integrate_L96_2t_with_coupling(
+                self.X, self.Y, si, nt, self.F, self.h, self.b, self.c,
+                t0=self.t, dt=self.dt
+            )
+        
+        if store:
+            self.X, self.Y, self.t = X[-1], Y[-1], t[-1]
+            
+        return (X, Y, t, C) if return_coupling else (X, Y, t)
+
+
+    
 if __name__ == "__main__":
-    # 논문에서 언급된 파라미터 설정
-    K = 8       # 저주파수, 대진폭 X 변수의 수
-    J = 32      # 고주파수, 소진폭 Y 변수의 수 (각 X당)
-    F = 20      # 강제력 항
-    h = 1       # 결합 계수
-    b = 10      # 진폭 비율
-    c_values = [4, 10]  # 시간 스케일 비율 (두 가지 경우)
+    # Arnold's experimental setup
+    K = 8       # Number of X variables (low-frequency, large-amplitude)
+    J = 32      # Number of Y variables per X (high-frequency, small-amplitude)
+    F = 20.0    # Forcing
+    h = 1.0     # Coupling coefficient
+    b = 10.0    # Ratio of amplitudes
     
-    # 논문에서 언급된 대로 적응형 RK4 방법 사용
-    dt_init = 0.001  # 초기 시간 간격
-    dt_max = 0.001   # 최대 시간 간격 (논문에서 언급)
+    # 두 가지 time-scale ratio 설정
+    c_values = [4.0, 10.0]
     
-    # 결과 저장을 위한 디렉토리 생성
-    if not os.path.exists("results"):
-        os.makedirs("results")
+    # 적분 파라미터
+    dt = 0.001  # Maximum time step (MTU)
+    si = 0.001  # Sampling interval
+    spinup_time = 100.0  # Spin-up time to remove transients
     
+    # 자기상관 분석을 위한 긴 시간 적분
+    analysis_time = 50.0  # 분석을 위한 긴 시간 적분 (MTU)
+    
+    print("\n=== Temporal Autocorrelation Analysis ===")
+    
+    plt.figure(figsize=(15, 10))
+    for i, c in enumerate(c_values):
+        print(f"\n분석 중: time-scale ratio c = {c}")
+        
+        # 모델 초기화 및 스핀업
+        model = L96(K, J, F=F, h=h, b=b, c=c, dt=dt)
+        print("스핀업 수행 중...")
+        X_spinup, Y_spinup, t_spinup = model.run(si, spinup_time, store=True, adaptive=True, tol=1e-6)
+        
+        # 분석을 위한 긴 시간 적분
+        print("긴 시간 적분 수행 중...")
+        X_analysis, Y_analysis, t_analysis = model.run(si, analysis_time, store=True, adaptive=True, tol=1e-6)
+        
+        # 시계열 자기상관 계산
+        max_lag = int(30.0 / si)  # 30 MTU까지의 lag 계산
+        autocorr_all = np.zeros((K, max_lag+1))
+        
+        # 개별 변수별 자기상관 계산
+        plt.subplot(2, 2, i+1)
+        for k in tqdm(range(K)):
+            # statsmodels의 acf 함수 사용
+            autocorr_all[k] = acf(X_analysis[:, k], nlags=max_lag, fft=True)
+            # 개별 변수의 자기상관 플롯 (연한 색상)
+            plt.plot(np.arange(max_lag+1) * si, autocorr_all[k], alpha=0.3, 
+                    label=f'X_{k+1}')
+            
+        # K개 변수의 평균 자기상관
+        autocorr = np.mean(autocorr_all, axis=0)
+        
+        # 평균 자기상관 플롯 (굵은 검은색 선)
+        plt.plot(np.arange(max_lag+1) * si, autocorr, 'k-', linewidth=2, label='Mean')
+        plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        plt.grid(True, alpha=0.3)
+        plt.xlabel('Lag (MTU)')
+        plt.ylabel('Autocorrelation')
+        plt.title(f'Individual Autocorrelations (c = {c})')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        
+        # 평균 자기상관만 따로 표시
+        plt.subplot(2, 2, i+3)
+        plt.plot(np.arange(max_lag+1) * si, autocorr, 'b-', linewidth=2)
+        plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        plt.grid(True, alpha=0.3)
+        plt.xlabel('Lag (MTU)')
+        plt.ylabel('Mean Autocorrelation')
+        plt.title(f'Mean Autocorrelation (c = {c})')
+        
+        # 주요 시점들의 자기상관 값 표시
+        important_lags = [5, 10, 15, 20]
+        for lag in important_lags:
+            lag_idx = int(lag / si)
+            plt.plot(lag, autocorr[lag_idx], 'ro')
+            # 5, 15 MTU는 위쪽에, 10, 20 MTU는 아래쪽에 표시
+            y_offset = 0.3 if lag in [5, 15] else -0.3
+            plt.annotate(f'r({lag} MTU) = {autocorr[lag_idx]:.3f}', 
+                        xy=(lag, autocorr[lag_idx]), 
+                        xytext=(lag + 2, autocorr[lag_idx] + y_offset),
+                        arrowprops=dict(arrowstyle='->', color='gray', alpha=0.5),
+                        bbox=dict(boxstyle='round,pad=0.5', fc='white', ec='gray', alpha=0.8))
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 자기상관 분석 결과를 바탕으로 실제 실험 수행
+    interval = 10.0  # 자기상관 분석 결과를 바탕으로 선택된 간격 (MTU)
+    num_ic = 300    # Number of initial conditions
+    forecast_time = 0.2  # Forecast time for each run (MTU)
+    
+    # 결과 저장을 위한 딕셔너리
+    results = {}
+    print("\n=== Running Main Experiment ===")
     for c in c_values:
-        print(f"시간 스케일 비율 c = {c} 에 대한 실험 시작")
+        print(f"\n실험 수행 중: time-scale ratio c = {c}")
         
-        # 모델 초기화
-        model = L96(K, J, F=F, h=h, b=b, c=c, dt=dt_init)
+        # 모델 초기화 및 스핀업
+        model = L96(K, J, F=F, h=h, b=b, c=c, dt=dt)
+        print("스핀업 수행 중...")
+        X_spinup, Y_spinup, t_spinup = model.run(si, spinup_time, store=True, adaptive=True, tol=1e-6)
         
-        # 초기 과도 상태(transient) 제거
-        print("과도 상태 제거 중...")
-        model.run(0.01, 100, store=True)  # 샘플링 간격 0.01, 총 시간 100 MTU
+        # 300개의 초기 조건 생성 및 적분
+        X_all = []
+        t_all = []
         
-        # 300개의 초기 조건 생성 (10 MTU 간격으로)
-        print("300개의 초기 조건 생성 중...")
-        initial_conditions = []
+        print(f"{num_ic}개의 예측 수행 중...")
+        for i in tqdm(range(num_ic)):
+            # 각 초기 조건에서 예측 수행
+            X, Y, t = model.run(si, interval, store=True, adaptive=True, tol=1e-6)
+            X_forecast, Y_forecast, t_forecast = model.run(si, forecast_time, store=True, adaptive=True, tol=1e-6)
+            
+            X_all.append(X_forecast)
+            t_all.append(t_forecast)
         
-        for i in range(300):
-            # 10 MTU 간격으로 실행 (논문에서 언급된 대로)
-            X, Y, t = model.run(0.01, 10, store=True)  # 샘플링 간격 0.01, 총 시간 10 MTU
-            # 마지막 상태를 초기 조건으로 저장
-            initial_conditions.append((X[-1].copy(), Y[-1].copy()))
-            
-            if (i+1) % 50 == 0:
-                print(f"  {i+1}/300 초기 조건 생성 완료")
-        
-        # 각 초기 조건에서 "진실" 실행
-        print("각 초기 조건에서 진실 실행 중...")
-        
-        # TODO change for-loop to multiprocess
-        # 예시로 첫 5개 초기 조건에 대해서만 그래프 생성
-        for i in range(5):
-            X0, Y0 = initial_conditions[i]
-            
-            # 모델 초기화
-            model.set_state(X0, Y0)
-            
-            # 적응형 시간 간격으로 실행
-            X, Y, t, C = model.run_adaptive(5, tol=1e-6, dt_min=1e-6, dt_max=dt_max, store=False, return_coupling=True)
-            
-            # 결과 저장
-            np.save(f"results/X_c{c}_ic{i}.npy", X)
-            np.save(f"results/Y_c{c}_ic{i}.npy", Y)
-            np.save(f"results/t_c{c}_ic{i}.npy", t)
-            np.save(f"results/C_c{c}_ic{i}.npy", C)
-            
-            # 그래프 생성
-            plt.figure(figsize=(12, 8))
-            
-            # X 변수 그래프
-            plt.subplot(2, 1, 1)
-            for k in range(K):
-                plt.plot(t, X[:, k], label=f'X{k+1}' if k < 3 else "")
-            plt.title(f'Lorenz 96 모델 (c={c}, 초기 조건 #{i+1})')
-            plt.ylabel('X 값')
-            if k < 3:
-                plt.legend()
-            
-            # Y 변수 그래프 (첫 번째 X에 연결된 Y만 표시)
-            plt.subplot(2, 1, 2)
-            for j in range(min(5, J)):  # 처음 5개 Y만 표시
-                plt.plot(t, Y[:, j], label=f'Y{j+1}' if j < 3 else "")
-            plt.xlabel('시간 (MTU)')
-            plt.ylabel('Y 값')
-            if j < 3:
-                plt.legend()
-            
-            plt.tight_layout()
-            plt.savefig(f"results/lorenz96_c{c}_ic{i}.png", dpi=300)
-            plt.close()
-            
-            if (i+1) % 1 == 0:
-                print(f"  초기 조건 #{i+1} 완료")
-        
-        print(f"c = {c}에 대한 실험 완료\n")
+        results[c] = {
+            'X': np.array(X_all),
+            't': np.array(t_all)
+        }
     
-    print("모든 실험 완료!")
+    # 상태 공간 플롯 (X1 vs X2)
+    plt.figure(figsize=(12, 5))
+    for i, c in enumerate(c_values):
+        plt.subplot(1, 2, i+1)
+        plt.plot(results[c]['X'][:, :, 0].flatten(), 
+                results[c]['X'][:, :, 1].flatten(), 
+                '.', alpha=0.1, markersize=1)
+        plt.xlabel('X₁')
+        plt.ylabel('X₂')
+        plt.title(f'State Space Plot (c = {c})')
+        plt.grid(True, alpha=0.3)
     
-    # 결과 요약
-    print("\n결과 요약:")
-    print(f"- 생성된 초기 조건 수: 300")
-    print(f"- 시간 스케일 비율: {c_values}")
-    print(f"- 저장된 파일 위치: ./results/")
-    print("- 생성된 파일:")
-    print("  * X_c{c}_ic{i}.npy: X 변수 시계열")
-    print("  * Y_c{c}_ic{i}.npy: Y 변수 시계열")
-    print("  * t_c{c}_ic{i}.npy: 시간 배열")
-    print("  * C_c{c}_ic{i}.npy: 결합 항")
-    print("  * lorenz96_c{c}_ic{i}.png: 시계열 그래프")
+    plt.tight_layout()
+    plt.show()
