@@ -516,11 +516,14 @@ if __name__ == "__main__":
     all_X = np.zeros((num_ic, time_steps_per_ic, K))
     all_Y = np.zeros((num_ic, time_steps_per_ic, J * K))
     all_t = np.zeros((num_ic, time_steps_per_ic))
+    all_C = np.zeros((num_ic, time_steps_per_ic, K))
+    
     ic_X = np.zeros((num_ic, K))
     ic_Y = np.zeros((num_ic, J * K))
+
     spinup_X = np.zeros((num_ic, K))
     spinup_Y = np.zeros((num_ic, J * K))
-
+    
     import time
     start_time = time.time()
     
@@ -535,18 +538,19 @@ if __name__ == "__main__":
         ic_Y[i] = model.Y
 
         # 3 MTU 동안 스핀업 실행 및 spinup 상태 저장
-        X_spinup, Y_spinup, t_spinup = model.run(si, spinup_time, store=True)
+        X_spinup, Y_spinup, t_spinup, C_spinup = model.run(si, spinup_time, store=True, return_coupling=True)
         spinup_X[i] = model.X
         spinup_Y[i] = model.Y
-
+        
         # t = 0으로 초기화 한 후, 10 MTU 동안 적분 후 마지막 상태 저장
         model.t = 0
-        X_forecast, Y_forecast, t_forecast = model.run(si, forecast_time, store=True)
+        X_forecast, Y_forecast, t_forecast, C_forecast = model.run(si, forecast_time, store=True, return_coupling=True)
         
         # 적분 결과 저장
         all_X[i] = X_forecast
         all_Y[i] = Y_forecast
         all_t[i] = t_forecast
+        all_C[i] = C_forecast
 
         # 초기화
         model.randomize_IC()
@@ -574,7 +578,7 @@ if __name__ == "__main__":
         np.save(f"{results_dir}/X_batch_{batch+1}.npy", all_X[start_idx:end_idx])
         np.save(f"{results_dir}/Y_batch_{batch+1}.npy", all_Y[start_idx:end_idx])
         np.save(f"{results_dir}/t_batch_{batch+1}.npy", all_t[start_idx:end_idx])
-
+        np.save(f"{results_dir}/C_batch_{batch+1}.npy", all_C[start_idx:end_idx])
     # 초기 조건 저장
     np.save(f"{results_dir}/ic_X.npy", ic_X)
     np.save(f"{results_dir}/ic_Y.npy", ic_Y)
@@ -597,8 +601,9 @@ if __name__ == "__main__":
         'num_batches': num_batches,
         'batch_size': batch_size
     }
-
-    np.save(f"{results_dir}/metadata.npy", metadata)
+    import json
+    with open(f"{results_dir}/metadata.json", "w") as f:
+        json.dump(metadata, f)
 
     print(f"\n데이터가 {results_dir} 디렉토리에 저장되었습니다.")
     print(f"총 {num_batches}개의 배치로 나누어 저장되었습니다.")
