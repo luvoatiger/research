@@ -108,7 +108,7 @@ class NeuralLorenz96(torch.nn.Module):
         Returns the full history with nt+1 values starting with initial conditions, X[:,0]=X0 and Y[:,0]=Y0,
         and ending with the final state, X[:,nt+1] and Y[:,nt+1] at time t0+nt*si.
 
-        Note the model is intergrated
+        Note the model is intergratedL
 
         Args:
             X0 : Values of X variables at the current time
@@ -135,6 +135,7 @@ class NeuralLorenz96(torch.nn.Module):
 
         K = X0.shape[1]
         J = Y0.shape[1] // X0.shape[1]
+
         for n in range(1, X0.shape[0]):
             # RK4 update of X,Y
             Xdot1, Ydot1, _ = self.neural_L96_2t_xdot_ydot(X, Y, K, J, h, F, c, b, neural_coupling[n-1])
@@ -306,6 +307,115 @@ def compare_coupling_terms(model_path, data_dir, batch_indices=None, time_steps=
     return fig1, fig2
     
 
+def plot_hovmoller_diagram(model_path, data_dir, batch_idx=1, save_path=None):
+    """
+    Lorenz 96 모델의 느린 변수(X)에 대한 Hovmöller 다이어그램을 생성하는 함수
+    
+    Args:
+        model_path: 학습된 모델 경로
+        data_dir: 테스트 데이터가 저장된 디렉토리
+        batch_idx: 사용할 배치 인덱스
+        save_path: 그래프 저장 경로 (None인 경우 저장하지 않음)
+    
+    Returns:
+        fig: 생성된 그래프 객체
+    """
+    # 모델 로드
+    subgrid_nn = SubgridNN()
+    model = NeuralLorenz96(subgrid_nn)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()  # 평가 모드로 설정
+    
+    # 파라미터 설정
+    K = 36  # 느린 변수(X)의 수
+    F = 20  # 외부 강제력
+    h = 1.0  # 커플링 계수
+    b = 10   # 진폭 비율
+    c = 10   # 시간 스케일 비율
+    dt = 0.005  # 기본 시간 간격
+
+    large_dt = 10*dt
+
+    # 데이터 로드
+    X_data = np.load(os.path.join(data_dir, f"X_batch_{batch_idx}.npy"))
+    Y_data = np.load(os.path.join(data_dir, f"Y_batch_{batch_idx}.npy"))
+    C_data = np.load(os.path.join(data_dir, f"C_batch_{batch_idx}.npy"))
+
+    X_data = torch.from_numpy(X_data).float()
+    Y_data = torch.from_numpy(Y_data).float()
+    C_data = torch.from_numpy(C_data).float()
+    
+    # 입력 텐서의 shape이 [batch_size, timestep, features]인 경우 [timestep, features]로 차원 축소
+    if len(X_data.shape) > 2:  # 3차원 텐서인 경우
+        X_data = X_data[0]
+        Y_data = Y_data[0]
+        C_data = C_data[0]
+
+    predicted_X, _ = model.integrate_L96_2t_with_neural_coupling(
+        X_data,
+        Y_data,
+        F,
+        h,
+        b,
+        c,
+        dt=large_dt,
+        neural_coupling=model.subgrid_nn(X_data)
+    )
+    
+    # 10dt로 적분된 predicted_X에서 200 인덱스까지만 슬라이싱(=2000개의 데이터 포인트)
+    predicted_X = predicted_X.detach().numpy()
+    
+    predicted_X = predicted_X[:200]
+
+    # X_data에서 10 인덱스 간격으로 샘플링한 데이터 포인트 추출
+    X_data_sampled = X_data[::10][:200]
+
+    # 예측값과 샘플링된 실제 데이터의 차이 계산
+    diff_X = X_data_sampled - predicted_X
+    
+    # 논문과 같은 스타일로 Hovmöller 다이어그램 생성
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    
+    # 컬러맵 설정
+    cmap1 = plt.cm.viridis  # 상단 및 중간 패널용
+    cmap2 = plt.cm.coolwarm  # 하단 패널용
+        
+    # 실제 X 값 (True X)
+    im1 = axes[0].imshow(X_data.T, aspect='auto', cmap=cmap1, 
+                         interpolation='none', origin='lower',
+                         extent=[0, 10, 0, K], vmin=-10, vmax=10)
+    axes[0].set_ylabel('True X')
+    fig.colorbar(im1, ax=axes[0], orientation='vertical', pad=0.01)
+    
+    # 예측된 X 값 (Pred X̂)
+    im2 = axes[1].imshow(predicted_X.T, aspect='auto', cmap=cmap1, 
+                         interpolation='none', origin='lower',
+                         extent=[0, 10, 0, K], vmin=-10, vmax=10)
+    axes[1].set_ylabel('Pred X̂')
+    fig.colorbar(im2, ax=axes[1], orientation='vertical', pad=0.01)
+    
+    # 차이 (X - X̂)
+    # 차이의 최대 절대값을 기준으로 컬러맵 범위 설정
+    max_diff = 20  # 논문과 같은 스케일 사용
+    im3 = axes[2].imshow(diff_X.T, aspect='auto', cmap=cmap2, 
+                         interpolation='none', origin='lower',
+                         extent=[0, 10, 0, K],
+                         vmin=-max_diff, vmax=max_diff)
+    axes[2].set_xlabel('Time')
+    axes[2].set_ylabel('X - X̂')
+    fig.colorbar(im3, ax=axes[2], orientation='vertical', pad=0.01)
+    
+    # 레이아웃 조정
+    plt.tight_layout()
+    
+    # 그래프 저장
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    plt.show()
+    
+    return fig
+
 
 if __name__ == "__main__":
     # 파라미터 설정
@@ -392,9 +502,15 @@ if __name__ == "__main__":
     data_dir = os.path.join(os.getcwd(), "simulated_data")
     save_path = os.path.join(os.getcwd(), "coupling_comparison.png")
     
-    # 랜덤하게 5개의 배치 선택
+    # 랜덤하게 1개의 배치 선택
     batch_indices = np.random.choice(range(1, 301), size=1, replace=False)
     
     # 커플링 항 비교 및 시각화
     compare_coupling_terms(model_path, data_dir, batch_indices=batch_indices, 
                           time_steps=2000, save_path=save_path)
+    
+    # 10 MTU 단위로 Slow variable 예측 후 차이 시각화
+    save_path = os.path.join(os.getcwd(), "hovmoller_diagram.png")
+
+    # Hovmöller 다이어그램 생성
+    plot_hovmoller_diagram(model_path, data_dir, batch_idx=batch_indices[0], save_path=save_path)
