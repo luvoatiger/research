@@ -292,7 +292,7 @@ def compare_coupling_terms(model_path, data_dir, batch_indices=None, time_steps=
         distribution_save_path = save_path.replace('.png', '_distribution.png')
         plt.savefig(distribution_save_path, dpi=300, bbox_inches='tight')
     
-#    plt.show()
+    plt.show()
     
     print(f"차이값 통계:")
     print(f"  최소값: {difference.min():.4f}")
@@ -408,7 +408,7 @@ def plot_hovmoller_diagram(model_path, data_dir, batch_idx=1, save_path=None):
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     
-#    plt.show()
+    plt.show()
     
     return fig
 
@@ -439,12 +439,14 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.subgrid_nn.parameters(), lr=0.001)
     criterion = torch.nn.MSELoss()        
     losses = []
-    '''
+    
     # 데이터를 batch_size 만큼 묶어서 학습
     for n in range(num_epoch):
         # batch_size가 100이므로, 0부터 300 사이에 있는 100개의 정수를 랜덤으로 추출
         sample_idx = np.random.choice(np.arange(300), size=100, replace=False)
         batch = []
+
+        # random_start_point 설정
         random_start_point = np.random.randint(0, len(X_data[0]) - m_delta_t)
         for idx in sample_idx:
             # 전체 데이터에서 해당 idx의 X_data, Y_data, t_data, C_data 데이터를 텐서로 변환
@@ -452,7 +454,6 @@ if __name__ == "__main__":
             Y_data = torch.from_numpy(data_list[idx][1]).float()
             C_data = torch.from_numpy(data_list[idx][2]).float()
 
-            # random_start_point 설정
 
             # ramdom_start_point 에서 m_delta_t 만큼의 데이터를 해당 idx의 데이터에서 추출
             sliced_X_data = X_data[:, random_start_point:random_start_point + m_delta_t, :]
@@ -497,7 +498,7 @@ if __name__ == "__main__":
     plt.plot(losses)
     plt.savefig(os.path.join(os.getcwd(), "baseline_models", "loss.png"))
     plt.show()
-    '''
+    
     # 모델 및 데이터 경로 설정
     model_path = os.path.join(os.getcwd(), "baseline_models", "subgrid_nn.pth")
     data_dir = os.path.join(os.getcwd(), "simulated_data")
