@@ -9,7 +9,7 @@ import torch
 
 
 class SubgridNN(torch.nn.Module):
-    def __init__(self, input_dim=36, hidden_dim=100, output_dim=36):
+    def __init__(self, input_dim=36, hidden_dim=128, output_dim=36):
         """
         Lorenz 96 시스템의 커플링 항을 근사하는 신경망
         
@@ -79,12 +79,14 @@ class NeuralLorenz96(torch.nn.Module):
             h = torch.tensor(h, dtype=torch.float32, device=device)
         if not isinstance(c, torch.Tensor):
             c = torch.tensor(c, dtype=torch.float32, device=device)
-        if not isinstance(b, torch.Tensor):
-            b = torch.tensor(b, dtype=torch.float32, device=device)
         
         
         # X의 미분 계산 (PyTorch 연산 사용)
-        Xdot = torch.roll(X, shifts=1, dims=0) * (torch.roll(X, shifts=-1, dims=0) - torch.roll(X, shifts=2, dims=0)) - X + F - c*neural_coupling
+        X_minus_1 = torch.roll(X, shifts=1, dims=0)
+        X_plus_1 = torch.roll(X, shifts=-1, dims=0)
+        X_minus_2 = torch.roll(X, shifts=2, dims=0)
+
+        Xdot = X_minus_1 * (X_plus_1 - X_minus_2) - X + F + neural_coupling
         
         # Y의 미분 계산
         # Y_plus_1, Y_plus_2, Y_minus_1 계산 (마지막 차원에 대해 roll)
@@ -96,8 +98,8 @@ class NeuralLorenz96(torch.nn.Module):
         X_repeated = torch.repeat_interleave(X, J, dim=-1)
           
         # Ydot 계산
-        hcb = h * c / b
-        Ydot = -c * b * Y_plus_1 * (Y_plus_2 - Y_minus_1) - c * Y + hcb * X_repeated
+        hcJ = h * c / J
+        Ydot = -c * J * Y_plus_1 * (Y_plus_2 - Y_minus_1) - c * Y + hcJ * X_repeated
         
         return Xdot, Ydot, neural_coupling
 
@@ -190,7 +192,6 @@ def compare_coupling_terms(model_path, data_dir, batch_indices=None, time_steps=
     Returns:
         fig1, fig2: 생성된 그래프 객체들
     """
-    c = 10
     # 모델 로드
     subgrid_nn = SubgridNN()
     model = NeuralLorenz96(subgrid_nn)
@@ -207,12 +208,7 @@ def compare_coupling_terms(model_path, data_dir, batch_indices=None, time_steps=
     
     for idx in batch_indices:
         X_data = np.load(os.path.join(data_dir, f"X_batch_{idx}.npy"))
-        C_data = np.load(os.path.join(data_dir, f"C_batch_{idx}.npy")) / c
-        
-        # 시간 단계 제한
-        if time_steps is not None and time_steps < X_data.shape[1]:
-            X_data = X_data[:, :time_steps, :]
-            C_data = C_data[:, :time_steps, :]
+        C_data = np.load(os.path.join(data_dir, f"C_batch_{idx}.npy"))
         
         all_X_data.append(X_data)
         all_true_coupling.append(C_data)
@@ -296,7 +292,7 @@ def compare_coupling_terms(model_path, data_dir, batch_indices=None, time_steps=
         distribution_save_path = save_path.replace('.png', '_distribution.png')
         plt.savefig(distribution_save_path, dpi=300, bbox_inches='tight')
     
-    plt.show()
+#    plt.show()
     
     print(f"차이값 통계:")
     print(f"  최소값: {difference.min():.4f}")
@@ -412,7 +408,7 @@ def plot_hovmoller_diagram(model_path, data_dir, batch_idx=1, save_path=None):
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     
-    plt.show()
+#    plt.show()
     
     return fig
 
@@ -431,7 +427,6 @@ if __name__ == "__main__":
     b = 10    # Ratio of amplitudes
     
     c = 10    # time-scale ratio 설정
-    
     # 데이터 로드
     data_list = []
     for i in range(1, 301):
@@ -442,13 +437,15 @@ if __name__ == "__main__":
 
     model = NeuralLorenz96(SubgridNN())
     optimizer = torch.optim.Adam(model.subgrid_nn.parameters(), lr=0.001)
-    criterion = torch.nn.MSELoss()
-
+    criterion = torch.nn.MSELoss()        
+    losses = []
+    '''
     # 데이터를 batch_size 만큼 묶어서 학습
     for n in range(num_epoch):
         # batch_size가 100이므로, 0부터 300 사이에 있는 100개의 정수를 랜덤으로 추출
         sample_idx = np.random.choice(np.arange(300), size=100, replace=False)
         batch = []
+        random_start_point = np.random.randint(0, len(X_data[0]) - m_delta_t)
         for idx in sample_idx:
             # 전체 데이터에서 해당 idx의 X_data, Y_data, t_data, C_data 데이터를 텐서로 변환
             X_data = torch.from_numpy(data_list[idx][0]).float()
@@ -456,7 +453,6 @@ if __name__ == "__main__":
             C_data = torch.from_numpy(data_list[idx][2]).float()
 
             # random_start_point 설정
-            random_start_point = np.random.randint(0, len(X_data[0]) - m_delta_t)
 
             # ramdom_start_point 에서 m_delta_t 만큼의 데이터를 해당 idx의 데이터에서 추출
             sliced_X_data = X_data[:, random_start_point:random_start_point + m_delta_t, :]
@@ -492,25 +488,29 @@ if __name__ == "__main__":
 
         # 학습 과정 출력
         print(f"Epoch {n+1}/{num_epoch}, Loss: {loss.item()}")
-
+        losses.append(loss.item())
     # 학습된 모델 저장
     os.makedirs(os.path.join(os.getcwd(), "baseline_models"), exist_ok=True)
     torch.save(model.state_dict(), os.path.join(os.getcwd(), "baseline_models", "subgrid_nn.pth"))   
-    
+
+    plt.title("Loss")
+    plt.plot(losses)
+    plt.savefig(os.path.join(os.getcwd(), "baseline_models", "loss.png"))
+    plt.show()
+    '''
     # 모델 및 데이터 경로 설정
     model_path = os.path.join(os.getcwd(), "baseline_models", "subgrid_nn.pth")
     data_dir = os.path.join(os.getcwd(), "simulated_data")
-    save_path = os.path.join(os.getcwd(), "coupling_comparison.png")
     
     # 랜덤하게 1개의 배치 선택
-    batch_indices = np.random.choice(range(1, 301), size=1, replace=False)
-    
-    # 커플링 항 비교 및 시각화
-    compare_coupling_terms(model_path, data_dir, batch_indices=batch_indices, 
-                          time_steps=2000, save_path=save_path)
-    
+    batch_indices = np.random.choice(range(1, 301), size=1, replace=False)[0]
+    save_path = os.path.join(os.getcwd(), f"coupling_comparison_{i}.png")
+        # 커플링 항 비교 및 시각화
+    compare_coupling_terms(model_path, data_dir, batch_indices=[i], 
+                        time_steps=2000, save_path=save_path)
+
     # 10 MTU 단위로 Slow variable 예측 후 차이 시각화
-    save_path = os.path.join(os.getcwd(), "hovmoller_diagram.png")
+    save_path = os.path.join(os.getcwd(), f"hovmoller_diagram_{i}.png")
 
     # Hovmöller 다이어그램 생성
-    plot_hovmoller_diagram(model_path, data_dir, batch_idx=batch_indices[0], save_path=save_path)
+    plot_hovmoller_diagram(model_path, data_dir, batch_idx=i, save_path=save_path)

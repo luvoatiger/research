@@ -59,18 +59,18 @@ def L96_2t_xdot_ydot(X, Y, F, h, b, c):
     J = JK // K
     assert JK == J * K, "X and Y have incompatible shapes"
     Xdot = np.zeros(K)
-    hcb = (h * c) / b
+    hcb = (h * c) / J
 
     Ysummed = Y.reshape((K, J)).sum(axis=-1)
 
-    Xdot = np.roll(X, 1) * (np.roll(X, -1) - np.roll(X, 2)) - X + F - hcb * Ysummed
+    Xdot = np.roll(X, 1) * (np.roll(X, -1) - np.roll(X, 2)) - X + F - h * Ysummed / J
     Ydot = (
-        -c * b * np.roll(Y, -1) * (np.roll(Y, -2) - np.roll(Y, 1))
+        -c * J * np.roll(Y, -1) * (np.roll(Y, -2) - np.roll(Y, 1))
         - c * Y
         + hcb * np.repeat(X, J)
     )
 
-    return Xdot, Ydot, -hcb * Ysummed
+    return Xdot, Ydot, - h * Ysummed / J
 
 
 # Time-stepping methods ##########################################################################################
@@ -493,14 +493,14 @@ class L96:
 
     
 if __name__ == "__main__":
-    # Kim's experimental setup
+    # Kang's experimental setup
     K = 36  # Number of globa-scale variables X
     J = 10  # Number of local-scale Y variables per single global-scale X variable
     F = 20  # Forcing
     h = 1.0  # Coupling coefficient
     b = 10    # Ratio of amplitudes
 
-    si, dt = 0.005, 0.005  # Sampling time interval
+    si, dt = 0.05, 0.05  # Sampling time interval
     
     c = 10    # time-scale ratio 설정
 
@@ -575,13 +575,13 @@ if __name__ == "__main__":
         end_idx = min((batch + 1) * batch_size, num_ic)
         
         # 각 배치의 데이터 저장
-        np.save(f"{results_dir}/X_batch_{batch+1}.npy", all_X[start_idx:end_idx])
-        np.save(f"{results_dir}/Y_batch_{batch+1}.npy", all_Y[start_idx:end_idx])
-        np.save(f"{results_dir}/t_batch_{batch+1}.npy", all_t[start_idx:end_idx])
-        np.save(f"{results_dir}/C_batch_{batch+1}.npy", all_C[start_idx:end_idx])
+        np.save(f"{results_dir}/X_batch_{batch+1}_10dt.npy", all_X[start_idx:end_idx])
+        np.save(f"{results_dir}/Y_batch_{batch+1}_10dt.npy", all_Y[start_idx:end_idx])
+        np.save(f"{results_dir}/t_batch_{batch+1}_10dt.npy", all_t[start_idx:end_idx])
+        np.save(f"{results_dir}/C_batch_{batch+1}_10dt.npy", all_C[start_idx:end_idx])
     # 초기 조건 저장
-    np.save(f"{results_dir}/ic_X.npy", ic_X)
-    np.save(f"{results_dir}/ic_Y.npy", ic_Y)
+    np.save(f"{results_dir}/ic_X_10dt.npy", ic_X)
+    np.save(f"{results_dir}/ic_Y_10dt.npy", ic_Y)
 
     # 메타데이터 저장
     metadata = {
@@ -602,7 +602,7 @@ if __name__ == "__main__":
         'batch_size': batch_size
     }
     import json
-    with open(f"{results_dir}/metadata.json", "w") as f:
+    with open(f"{results_dir}/metadata_10dt.json", "w") as f:
         json.dump(metadata, f)
 
     print(f"\n데이터가 {results_dir} 디렉토리에 저장되었습니다.")
