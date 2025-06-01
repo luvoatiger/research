@@ -19,17 +19,47 @@ from tqdm import tqdm
 # =============================================================================
 class LSTMMemoryNetwork(torch.nn.Module):
     """
-    LSTM을 사용한 메모리 네트워크
-    
-    Args:
-        input_dim (int): 입력 차원
+    향상된 LSTM 메모리 네트워크
+        
+        Args:
+        input_dim (int): 입력 차원 (K)
         hidden_dim (int): LSTM 은닉 차원
-        output_dim (int): 출력 차원
+        output_dim (int): 출력 차원 (K)
+        num_layers (int): LSTM 층 수
+        dropout (float): 드롭아웃 비율
     """
-    def __init__(self, input_dim, hidden_dim=128, output_dim=8):
+    def __init__(self, input_dim, hidden_dim=256, output_dim=8, num_layers=2, dropout=0.1):
         super(LSTMMemoryNetwork, self).__init__()
-        self.lstm = torch.nn.LSTM(input_dim, hidden_dim, batch_first=True)
-        self.fc = torch.nn.Linear(hidden_dim, output_dim)
+        
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.num_layers = num_layers
+        
+        # BatchNorm을 LSTM 이후로 이동
+        self.feature_bn = torch.nn.BatchNorm1d(hidden_dim)
+        
+        # 입력 전처리 층
+        self.input_layer = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout)
+        )
+        
+        self.lstm = torch.nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        
+        self.output_layer = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, hidden_dim // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim // 2, output_dim)
+        )
 
     def forward(self, x):
         """
@@ -37,13 +67,28 @@ class LSTMMemoryNetwork(torch.nn.Module):
         
         Args:
             x (torch.Tensor): 입력 시퀀스 [batch_size, seq_len, input_dim]
-            
+            이미 forward_pass_2에서 정규화된 입력
         Returns:
             torch.Tensor: 출력 [batch_size, output_dim]
         """
-        lstm_out, _ = self.lstm(x)  # LSTM 출력
-        out = self.fc(lstm_out[:, -1, :])  # 마지막 시점의 출력만 사용
-        return out
+        batch_size, seq_len, _ = x.shape
+        
+        # 입력 전처리
+        x = x.view(-1, self.input_dim)
+        x = self.input_layer(x)
+        x = x.view(batch_size, seq_len, self.hidden_dim)
+        
+        # LSTM 처리
+        lstm_out, (h_n, c_n) = self.lstm(x)
+        last_output = lstm_out[:, -1, :]
+        
+        # LSTM 출력에 대한 BatchNorm
+        last_output = self.feature_bn(last_output)
+        
+        # 출력 생성
+        output = self.output_layer(last_output)
+        
+        return output
 
 def stepper_2(Xt, model, F, sigma_X, mu_X, dt):
     """
@@ -93,19 +138,19 @@ def forward_pass_2(Xt, Xth1, Xth2, model, sigma_X, mu_X):
     Xth2 = Xth2.float()
     
     # 정규화
-    H = (Xt-mu_X)/sigma_X
-    Hh1 = (Xth1-mu_X)/sigma_X
-    Hh2 = (Xth2-mu_X)/sigma_X
+    Xt_norm = (Xt - mu_X) / sigma_X
+    Xth1_norm = (Xth1 - mu_X) / sigma_X
+    Xth2_norm = (Xth2 - mu_X) / sigma_X
     
     # LSTM 입력을 위한 시퀀스 구성
-    sequence = torch.stack([Hh2, Hh1, H], dim=1)
+    sequence = torch.stack([Xth2_norm, Xth1_norm, Xt_norm], dim=1)
     
     # LSTM forward pass
     output = model(sequence)
     
     # 역정규화
     output = output * sigma_X + mu_X
-        
+    
     return output
 
 # =============================================================================
@@ -114,16 +159,16 @@ def forward_pass_2(Xt, Xth1, Xth2, model, sigma_X, mu_X):
 def evaluate_forward_pass_2(Xt, Xth1, Xth2, model, sigma_X, mu_X):
     """
     LSTM을 사용한 forward pass 평가 함수
-    
-    Args:
+        
+        Args:
         Xt (torch.Tensor/np.ndarray): 현재 시점의 상태
         Xth1 (torch.Tensor/np.ndarray): t-1 시점의 상태
         Xth2 (torch.Tensor/np.ndarray): t-2 시점의 상태
         model (LSTMMemoryNetwork): 학습된 LSTM 모델
         sigma_X (torch.Tensor/np.ndarray): 정규화를 위한 표준편차
         mu_X (torch.Tensor/np.ndarray): 정규화를 위한 평균
-        
-    Returns:
+
+        Returns:
         torch.Tensor: 모델 예측값 (역정규화된 상태)
     """
     # numpy 입력을 tensor로 변환
@@ -278,7 +323,7 @@ def integrate_L96_2t_with_coupling(X0, Y0, si, nt, F, h, b, c, t0=0, dt=0.001):
             )
             X = X + (dt / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
             Y = Y + (dt / 6.0) * ((Ydot1 + Ydot4) + 2.0 * (Ydot2 + Ydot3))
-            
+
         xhist.append(X)
         yhist.append(Y)
         time.append(t0 + si * (n + 1))
@@ -297,7 +342,8 @@ if __name__ == "__main__":
     
     fold = os.path.join(os.getcwd(), 'memory_models_v2')  # 새로운 폴더명
     os.makedirs(fold, exist_ok=True)
-    
+    model_save_path = os.path.join(fold, 'lstm_model.pth')
+
     # 시스템 파라미터 설정
     K = 8  # Number of globa-scale variables X
     J = 32  # Number of local-scale Y variables per single global-scale X variable
@@ -330,12 +376,13 @@ if __name__ == "__main__":
     # Sub-sampling (tmeporal sparsity)
     X_train = X[::2,:]
 
-    # Corrupting data with noise(PASS)
-    np.save(os.path.join(fold, 'X_train.npy'), X_train)
 
     # First training routine where we target state at the next time-step
     n_hist = 2
     n_fut = 1
+    '''
+    # Corrupting data with noise(PASS)
+    np.save(os.path.join(fold, 'X_train.npy'), X_train)
 
     Xt = []
     for i in range(2*n_hist+1+1):
@@ -348,7 +395,13 @@ if __name__ == "__main__":
     sigma_X = np.max(np.abs(X_train), axis=0)
 
     # LSTM 모델 초기화를 float32로 변경
-    model = LSTMMemoryNetwork(K)  # float32로 변경
+    model = LSTMMemoryNetwork(
+        input_dim=8,      # Lorenz 96의 K값
+        hidden_dim=256,   # 은닉 차원
+        output_dim=8,     # 출력 차원 (K와 동일)
+        num_layers=2,     # LSTM 층 수
+        dropout=0.1       # 드롭아웃 비율
+    )
     
     # 옵티마이저 설정
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -361,7 +414,7 @@ if __name__ == "__main__":
     mu_X = torch.from_numpy(mu_X).float()
     
     # 학습 파라미터 수정
-    n_epochs = 1000  # 에폭 수 증가
+    n_epochs = 100  # 에폭 수 증가
     batch_size = 512
     
     # Early stopping 추가
@@ -403,14 +456,14 @@ if __name__ == "__main__":
         'mu_X': mu_X,
         'hyperparameters': {
             'input_dim': K,
-            'hidden_dim': 128,
+            'hidden_dim': 256,
             'output_dim': K,
             'batch_size': batch_size,
             'learning_rate': 1e-3
         }
     }, model_save_path)
     print(f'모델이 저장되었습니다: {model_save_path}')
-
+    '''
     # Evaluation
     # 평가를 위한 모델 로드
     checkpoint = torch.load(model_save_path)
@@ -422,23 +475,31 @@ if __name__ == "__main__":
     eval_model.load_state_dict(checkpoint['model_state_dict'])
     eval_model.eval()
 
+    # Interpolation 평가
+    # 시뮬레이션 시간 스텝 수
     nt = 1000
+
+    # 시뮬레이션 실행
     X_int, Y_int, t, _ = integrate_L96_2t_with_coupling(X[0,:], Y[0,:], si/2, 2*nt, F, h, b, c, 0, dt/2)
     X_int = X_int[::2,:]
     Y_int = Y_int[::2,:]
     t = t[::2]
-
+    print(X_int.shape, Y_int.shape, t.shape)
+    # 2배 시간 스텝으로 변환
     X_int2dt = X_int[::2,:]
     Y_int2dt = Y_int[::2,:]
     t_2dt = t[::2]
+    print(X_int2dt.shape, Y_int2dt.shape, t_2dt.shape)
+    # 2배 시간 스텝으로 변환된 데이터 추출
     Xt_dt = X_int2dt[2:,:]
     Xth1_dt = X_int2dt[1:-1,:]
     Xth2_dt = X_int2dt[:-2,:]
-    
+    print(Xt_dt.shape, Xth1_dt.shape, Xth2_dt.shape)
+    # 모델 출력 계산
     NN_out = evaluate_forward_pass_2(Xt_dt, Xth1_dt, Xth2_dt, eval_model, sigma_X, mu_X) 
     Xpred_int = integrate_L96_2t_with_NN_2(X_int[0:2*n_hist+2,:], si, nt-2*n_hist-1, eval_model, F, sigma_X, mu_X, 0, 2*dt)
-    print(NN_out.shape)
-    print(Xpred_int.shape)
+    print("NN_out.shape", NN_out.shape)
+    print("Xpred_int.shape", Xpred_int.shape)
     exact_out_int = []
     
     for ii in range(K):
@@ -453,7 +514,7 @@ if __name__ == "__main__":
         exact_out_int.append(exact_out)
 
     exact_out_int = np.array(exact_out_int)
-    print(exact_out_int.shape)
+    print("exact_out_int.shape", exact_out_int.shape)
     ####### Extrap ######
     Xpred_init = X[-2-2*n_hist:,:]
     
@@ -470,10 +531,10 @@ if __name__ == "__main__":
     Xth2_dt = X_ext2dt[:-2,:]
     
     NN_out_ext = evaluate_forward_pass_2(Xt_dt, Xth1_dt, Xth2_dt, eval_model, sigma_X, mu_X) 
-    print(NN_out_ext.shape)
+    print("NN_out_ext.shape", NN_out_ext.shape)
     Xpred_ext = integrate_L96_2t_with_NN_2(Xpred_init, si, nt, eval_model, F, sigma_X, mu_X, 0, 2*dt)
+    print("Xpred_ext.shape", Xpred_ext.shape)
     Xpred_ext = Xpred_ext[2*n_hist+1:,:]
-    print(Xpred_ext.shape)
     exact_out_ext = []
     
     for ii in range(K):
@@ -488,15 +549,15 @@ if __name__ == "__main__":
         exact_out_ext.append(exact_out)
 
     exact_out_ext = np.array(exact_out_ext)
-    print(exact_out_ext.shape)
+    print("exact_out_ext.shape", exact_out_ext.shape)
     err_int_det = np.linalg.norm(X_int-Xpred_int) / np.linalg.norm(X_int)
-    err_ext_det = np.linalg.norm(X_ext-Xpred_ext) / np.linalg.norm(X_ext)
+    err_int_NN_det = np.linalg.norm(exact_out_int-NN_out.detach().numpy().T) / np.linalg.norm(exact_out_int)
     print('Relative interpolation norm det: ',err_int_det)
-    print('Relative extrapolation norm det: ',err_ext_det)
-    
-    err_int_NN_det = np.linalg.norm(exact_out_int-NN_out.T) / np.linalg.norm(exact_out_int)
-    err_ext_NN_det = np.linalg.norm(exact_out_ext-NN_out_ext.T) / np.linalg.norm(exact_out_ext)
     print('Relative interpolation norm Closure det: ',err_int_NN_det)
+    
+    err_ext_det = np.linalg.norm(X_ext-Xpred_ext) / np.linalg.norm(X_ext)
+    err_ext_NN_det = np.linalg.norm(exact_out_ext-NN_out_ext.detach().numpy().T) / np.linalg.norm(exact_out_ext)
+    print('Relative extrapolation norm det: ',err_ext_det)
     print('Relative extrapolation norm Closure det: ',err_ext_NN_det)
 
     np.save(fold+'/X_pred_int_det', Xpred_int)
