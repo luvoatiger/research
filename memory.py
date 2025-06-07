@@ -17,78 +17,87 @@ from tqdm import tqdm
 # =============================================================================
 # LSTM 메모리 네트워크 클래스
 # =============================================================================
-class LSTMMemoryNetwork(torch.nn.Module):
-    """
-    향상된 LSTM 메모리 네트워크
-        
-        Args:
-        input_dim (int): 입력 차원 (K)
-        hidden_dim (int): LSTM 은닉 차원
-        output_dim (int): 출력 차원 (K)
-        num_layers (int): LSTM 층 수
-        dropout (float): 드롭아웃 비율
-    """
-    def __init__(self, input_dim, hidden_dim=256, output_dim=8, num_layers=2, dropout=0.3):
+import torch
+import torch.nn as nn
+
+class LSTMMemoryNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, output_dim=8, num_layers=1, dropout=0.3):
         super(LSTMMemoryNetwork, self).__init__()
-        
+
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.num_layers = num_layers
-        
-        # BatchNorm을 LSTM 이후로 이동
-        self.feature_bn = torch.nn.BatchNorm1d(hidden_dim)
-        
-        # 입력 전처리 층
-        self.input_layer = torch.nn.Sequential(
-            torch.nn.Linear(input_dim, hidden_dim),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout)
+
+        # 입력 전처리 층 (입력 feature별 처리)
+        self.input_layer = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Dropout(dropout)
         )
-        
-        self.lstm = torch.nn.LSTM(
+
+        # LSTM
+        self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=False  # 명시적 causal 보장
         )
-        
-        self.output_layer = torch.nn.Sequential(
-            torch.nn.Linear(hidden_dim, hidden_dim // 2),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_dim // 2, output_dim)
+
+        # LSTM 출력 정규화
+        self.feature_norm = nn.LayerNorm(hidden_dim)
+
+        # 출력 레이어
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LeakyReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, output_dim),
+            nn.Tanh()
         )
+
+        # 출력 스케일 learnable parameter
+        self.output_scale = nn.Parameter(torch.tensor(0.5))
+
+        # 가중치 초기화
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for name, param in self.named_parameters():
+            if 'weight' in name and param.dim() > 1:
+                nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
 
     def forward(self, x):
         """
-        순전파
-        
         Args:
-            x (torch.Tensor): 입력 시퀀스 [batch_size, seq_len, input_dim]
-            이미 forward_pass_2에서 정규화된 입력
+            x: Tensor of shape [batch_size, seq_len, input_dim]
         Returns:
-            torch.Tensor: 출력 [batch_size, output_dim]
+            Tensor of shape [batch_size, output_dim]
         """
         batch_size, seq_len, _ = x.shape
-        
-        # 입력 전처리
-        x = x.view(-1, self.input_dim)
-        x = self.input_layer(x)
-        x = x.view(batch_size, seq_len, self.hidden_dim)
-        
-        # LSTM 처리
-        lstm_out, (h_n, c_n) = self.lstm(x)
-        last_output = lstm_out[:, -1, :]
-        
-        # LSTM 출력에 대한 BatchNorm
-        last_output = self.feature_bn(last_output)
-        
-        # 출력 생성
-        output = self.output_layer(last_output)
-        
+
+        # 입력 전처리 (시간-배치 단위 전개 후 다시 복원)
+        x_proj = self.input_layer(x.view(-1, self.input_dim)).view(batch_size, seq_len, self.hidden_dim)
+
+        # LSTM 통과
+        lstm_out, _ = self.lstm(x_proj)
+
+        # 마지막 시점 출력 추출
+        last_output = lstm_out[:, -1, :]  # [B, hidden_dim]
+
+        # 정규화
+        normed = self.feature_norm(last_output)
+
+        # 출력 예측 + residual
+        output = self.output_layer(normed)
+        output = output * self.output_scale  # learnable scale
+
         return output
+
 
 def stepper_2(Xt, model, F, sigma_X, mu_X, dt):
     """
@@ -598,7 +607,7 @@ if __name__ == "__main__":
     print("메모리 효과를 고려한 Lorenz 96 모델")
     
     # 과거 시점 개수 선택 (2 또는 10)
-    use_memory_points = 2  # 여기서 2나 10으로 설정
+    use_memory_points = 10  # 여기서 2나 10으로 설정
     
     fold = os.path.join(os.getcwd(), f'memory_models_v2_{use_memory_points}points')  # 폴더명에 시점 수 추가
     os.makedirs(fold, exist_ok=True)
@@ -636,7 +645,6 @@ if __name__ == "__main__":
     # Sub-sampling (tmeporal sparsity)
     X_train = X[::2,:]
 
-
     # First training routine where we target state at the next time-step
     if use_memory_points == 2:
         n_hist = 2  # 2개의 과거 시점
@@ -652,28 +660,27 @@ if __name__ == "__main__":
     Xt = np.transpose(np.array(Xt), (1, 0, 2)) # nt-2*n_hist-1 x 2*n_hist+2 x K
     Xtpdt = X_train[2*n_hist+2+n_fut-1:,:] # nt-2*n_hist-1 x K
     Ndata = Xt.shape[0]
+        
+    mu_X = np.mean(X_train, axis=0)
+    sigma_X = np.std(X_train, axis=0) + 1e-6  # 안정성 보장용 epsilon
+    # 학습 데이터 준비 (float32로 변경)
+    Xt = torch.from_numpy(Xt).float()
+    Xtpdt = torch.from_numpy(Xtpdt).float()
+    sigma_X = torch.from_numpy(sigma_X).float()
+    mu_X = torch.from_numpy(mu_X).float()
     
-    mu_X = np.zeros(X_train.shape[1])
-    sigma_X = np.max(np.abs(X_train), axis=0)
-
     # LSTM 모델 초기화를 float32로 변경
     model = LSTMMemoryNetwork(
         input_dim=8,      # Lorenz 96의 K값
         hidden_dim=256,   # 은닉 차원
         output_dim=8,     # 출력 차원 (K와 동일)
         num_layers=2,     # LSTM 층 수
-        dropout=0.1       # 드롭아웃 비율
+        dropout=0.3      # 드롭아웃 비율
     )
     
     # 옵티마이저 설정
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = torch.nn.MSELoss()
-    
-    # 학습 데이터 준비 (float32로 변경)
-    Xt = torch.from_numpy(Xt).float()
-    Xtpdt = torch.from_numpy(Xtpdt).float()
-    sigma_X = torch.from_numpy(sigma_X).float()
-    mu_X = torch.from_numpy(mu_X).float()
+    criterion = torch.nn.MSELoss()    
     
     # 학습 파라미터 수정
     n_epochs = 100  # 에폭 수 증가
@@ -681,6 +688,7 @@ if __name__ == "__main__":
         
     # 학습 루프
     model.train()
+    losses = []
     for epoch in tqdm(range(n_epochs)):
         epoch_loss = 0
         batch_count = 0
@@ -703,8 +711,20 @@ if __name__ == "__main__":
                     
         avg_epoch_loss = epoch_loss / batch_count
         print(f'Epoch {epoch}, Average Loss: {avg_epoch_loss:.10f}')
+        losses.append(avg_epoch_loss)
         
     print(f'Training finished')
+
+    # 손실값 플롯 저장
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(n_epochs), losses, 'b-', label='Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss Over Time')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(fold, 'training_loss.png'))
+    plt.close()
 
     # 모델 저장
     model_save_path = os.path.join(fold, 'lstm_model.pth')
@@ -729,7 +749,8 @@ if __name__ == "__main__":
     eval_model = LSTMMemoryNetwork(
         input_dim=checkpoint['hyperparameters']['input_dim'],
         hidden_dim=checkpoint['hyperparameters']['hidden_dim'],
-        output_dim=checkpoint['hyperparameters']['output_dim']
+        output_dim=checkpoint['hyperparameters']['output_dim'],
+        num_layers=2  # 학습 시와 동일하게 2개의 레이어 설정
     )
     eval_model.load_state_dict(checkpoint['model_state_dict'])
     eval_model.eval()
