@@ -6,6 +6,8 @@
 
 import os
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -17,523 +19,270 @@ from tqdm import tqdm
 # =============================================================================
 # LSTM 메모리 네트워크 클래스
 # =============================================================================
-import torch
-import torch.nn as nn
+
+class TemporalAttention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+    def forward(self, hidden_states):
+        # hidden_states: [batch, seq_len, hidden_dim]
+        scores = self.attention(hidden_states)  # [batch, seq_len, 1]
+        weights = torch.softmax(scores, dim=1)  # [batch, seq_len, 1]
+        context = torch.sum(hidden_states * weights, dim=1)  # [batch, hidden_dim]
+        return context, weights
 
 class LSTMMemoryNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim=64, output_dim=8, num_layers=1, dropout=0.3):
-        super(LSTMMemoryNetwork, self).__init__()
-
+    def __init__(self, input_dim, hidden_dim=256, output_dim=8, num_layers=2, dropout=0.3):
+        super().__init__()
+        
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.num_layers = num_layers
-
-        # 입력 전처리 층 (입력 feature별 처리)
+        
+        # 입력 전처리 층
         self.input_layer = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.LeakyReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout)
         )
-
+        
         # LSTM
         self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=False  # 명시적 causal 보장
+            dropout=dropout if num_layers > 1 else 0
         )
-
-        # LSTM 출력 정규화
-        self.feature_norm = nn.LayerNorm(hidden_dim)
-
-        # 출력 레이어
+        
+        # 시간적 어텐션
+        self.temporal_attention = TemporalAttention(hidden_dim)
+        
+        # 출력 레이어 (residual connection 포함)
         self.output_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LeakyReLU(),
+            nn.Linear(hidden_dim + input_dim, hidden_dim),  # 원본 입력을 concat
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, output_dim),
-            nn.Tanh()
+            nn.Linear(hidden_dim, output_dim),
+            nn.Tanh()  # 출력 안정화
         )
-
+        
         # 출력 스케일 learnable parameter
         self.output_scale = nn.Parameter(torch.tensor(0.5))
-
+        
         # 가중치 초기화
         self.reset_parameters()
-
+        
     def reset_parameters(self):
         for name, param in self.named_parameters():
             if 'weight' in name and param.dim() > 1:
                 nn.init.xavier_uniform_(param)
             elif 'bias' in name:
                 nn.init.zeros_(param)
-
+                
     def forward(self, x):
-        """
-        Args:
-            x: Tensor of shape [batch_size, seq_len, input_dim]
-        Returns:
-            Tensor of shape [batch_size, output_dim]
-        """
         batch_size, seq_len, _ = x.shape
-
-        # 입력 전처리 (시간-배치 단위 전개 후 다시 복원)
-        x_proj = self.input_layer(x.view(-1, self.input_dim)).view(batch_size, seq_len, self.hidden_dim)
-
+        
+        # 입력 전처리
+        x_proj = self.input_layer(x.reshape(-1, self.input_dim)).reshape(batch_size, seq_len, self.hidden_dim)
+        
         # LSTM 통과
         lstm_out, _ = self.lstm(x_proj)
-
-        # 마지막 시점 출력 추출
-        last_output = lstm_out[:, -1, :]  # [B, hidden_dim]
-
-        # 정규화
-        normed = self.feature_norm(last_output)
-
-        # 출력 예측 + residual
-        output = self.output_layer(normed)
-        output = output * self.output_scale  # learnable scale
-
+        
+        # 시간적 어텐션 적용
+        attended, _ = self.temporal_attention(lstm_out)
+        
+        # 원본 입력의 마지막 시점과 결합
+        final_input = torch.cat([attended, x[:, -1]], dim=1)
+        
+        # 출력 예측
+        output = self.output_layer(final_input)
+        output = output * self.output_scale
+        
         return output
 
 
-def stepper_2(Xt, model, F, sigma_X, mu_X, dt):
+def forward_pass_2(Xt, Xth1, Xth2, model, sigma_X, mu_X, is_eval=False):
     """
-    Xt: (batch_size, 2*n_hist+2, K)
-    model: LSTMMemoryNetwork 인스턴스
-    F: float
-    sigma_X: (K,)
-    mu_X: (K,)
-    dt: float
-    F: float
-
-    RK4 방법으로 DDE를 적분하여 현재 시점의 state X를 계산
+    LSTM을 사용한 forward pass 함수 (2개 과거 시점)
+    - 정규화에 epsilon 추가
+    - eval 모드 optional 지원
     """
-    past_X2 = Xt[:,-6,:]   #Xt의 각 batch에서 마지막 6번째 시점의 값
-    past_X = Xt[:,-4,:]    #Xt의 각 batch에서 마지막 4번째 시점의 값
-    current_X = Xt[:,-2,:] #Xt의 각 batch에서 마지막 2번째 시점의 값
+    eps = 1e-6  # 작은 수로 안정성 확보
 
-    Xdot1 = L96_2t_xdot_2(current_X, past_X, past_X2, model, F, sigma_X, mu_X)
-    Xdot2 = L96_2t_xdot_2(current_X + 0.5 * dt * Xdot1, past_X, past_X2, model, F, sigma_X, mu_X)
-    Xdot3 = L96_2t_xdot_2(current_X + 0.5 * dt * Xdot2, past_X, past_X2, model, F, sigma_X, mu_X)
-    Xdot4 = L96_2t_xdot_2(current_X + dt * Xdot3, past_X, past_X2, model, F, sigma_X, mu_X)
+    # gradient 계산을 위해 requires_grad=True 설정
+    Xt = Xt.float().requires_grad_(True)
+    Xth1 = Xth1.float().requires_grad_(True)
+    Xth2 = Xth2.float().requires_grad_(True)
 
-    X_future = Xt[:,-2,:] + (dt / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
+    # 정규화 (과거 → 현재 순)
+    Xt_norm = torch.clamp((Xt - mu_X) / (sigma_X + eps), -5.0, 5.0)
+    Xth1_norm = torch.clamp((Xth1 - mu_X) / (sigma_X + eps), -5.0, 5.0)
+    Xth2_norm = torch.clamp((Xth2 - mu_X) / (sigma_X + eps), -5.0, 5.0)
 
-    return X_future
-
-def L96_2t_xdot_2(Xt, Xth1, Xth2, model, F, sigma_X, mu_X):
-    """
-    Xt: (batch_size, K) - PyTorch tensor
-    Xth1: (batch_size, K) - PyTorch tensor
-    Xth2: (batch_size, K) - PyTorch tensor
-    """    
-    # Lorenz 96 시스템의 기본 항
-    Xdot = torch.roll(Xt, 1, dims=1) * (torch.roll(Xt, -1, dims=1) - torch.roll(Xt, 2, dims=1)) - Xt + F + forward_pass_2(Xt, Xth1, Xth2, model, sigma_X, mu_X)
-    
-    
-    return Xdot
-
-def forward_pass_2(Xt, Xth1, Xth2, model, sigma_X, mu_X):
-    """
-    LSTM을 사용한 forward pass 함수
-    시계열 데이터를 과거→현재 순서로 구성하고
-    정규화/역정규화 수행
-    """
-    Xt = Xt.float()
-    Xth1 = Xth1.float()
-    Xth2 = Xth2.float()
-    
-    # 정규화
-    Xt_norm = (Xt - mu_X) / sigma_X
-    Xth1_norm = (Xth1 - mu_X) / sigma_X
-    Xth2_norm = (Xth2 - mu_X) / sigma_X
-    
-    # LSTM 입력을 위한 시퀀스 구성
     sequence = torch.stack([Xth2_norm, Xth1_norm, Xt_norm], dim=1)
-    
-    # LSTM forward pass
-    output = model(sequence)
-    
+
+    # forward pass
+    if is_eval:
+        model.eval()
+        with torch.no_grad():
+            output = model(sequence)
+    else:
+        output = model(sequence)
+
     # 역정규화
     output = output * sigma_X + mu_X
-    
-    return output
+    return output  # detach 제거
 
 
-def forward_pass_10(Xt, Xth1, Xth2, Xth3, Xth4, Xth5, Xth6, Xth7, Xth8, Xth9, Xth10, model, sigma_X, mu_X):
+def L96_2t_xdot_2(Xt, Xth1, Xth2, model, F, sigma_X, mu_X, is_eval=False):
     """
-    LSTM을 사용한 forward pass 함수 (10개의 과거 시점 사용)
-    시계열 데이터를 과거→현재 순서로 구성하고
-    정규화/역정규화 수행
+    Lorenz 96 시스템의 시간 미분 계산 (memory term 포함)
     """
-    # float32로 변환
-    Xt = Xt.float()
-    Xth1 = Xth1.float()
-    Xth2 = Xth2.float()
-    Xth3 = Xth3.float()
-    Xth4 = Xth4.float()
-    Xth5 = Xth5.float()
-    Xth6 = Xth6.float()
-    Xth7 = Xth7.float()
-    Xth8 = Xth8.float()
-    Xth9 = Xth9.float()
-    Xth10 = Xth10.float()
-    
-    # 정규화
-    Xt_norm = (Xt - mu_X) / sigma_X
-    Xth1_norm = (Xth1 - mu_X) / sigma_X
-    Xth2_norm = (Xth2 - mu_X) / sigma_X
-    Xth3_norm = (Xth3 - mu_X) / sigma_X
-    Xth4_norm = (Xth4 - mu_X) / sigma_X
-    Xth5_norm = (Xth5 - mu_X) / sigma_X
-    Xth6_norm = (Xth6 - mu_X) / sigma_X
-    Xth7_norm = (Xth7 - mu_X) / sigma_X
-    Xth8_norm = (Xth8 - mu_X) / sigma_X
-    Xth9_norm = (Xth9 - mu_X) / sigma_X
-    Xth10_norm = (Xth10 - mu_X) / sigma_X
-    
-    # LSTM 입력을 위한 시퀀스 구성 (과거→현재 순서)
-    sequence = torch.stack([
-        Xth10_norm, Xth9_norm, Xth8_norm, Xth7_norm, Xth6_norm,
-        Xth5_norm, Xth4_norm, Xth3_norm, Xth2_norm, Xth1_norm,
-        Xt_norm
-    ], dim=1)
-    
-    # LSTM forward pass
-    output = model(sequence)
-    
-    # 역정규화
-    output = output * sigma_X + mu_X
-    
-    return output
+    # Lorenz 96 기본 항 계산
+    core_term = torch.roll(Xt, 1, dims=1) * (torch.roll(Xt, -1, dims=1) - torch.roll(Xt, 2, dims=1)) - Xt + F
+
+    # Memory term
+    memory_term = forward_pass_2(Xt, Xth1, Xth2, model, sigma_X, mu_X, is_eval=is_eval)
+
+    return core_term + memory_term
 
 
-def L96_2t_xdot_10(Xt, Xth1, Xth2, Xth3, Xth4, Xth5, Xth6, Xth7, Xth8, Xth9, Xth10, model, F, sigma_X, mu_X):
+def stepper_2(Xt, model, F, sigma_X, mu_X, dt, is_eval=False):
     """
-    LSTM 모델을 사용한 Lorenz 96 시스템의 시간 미분 계산 (10개 과거 시점 사용)
+    RK4 방법으로 다음 시점 상태 계산
+    Xt: [batch, 6, K] → 2개 과거 시점 기반 DDE
     """
-    # Lorenz 96 시스템의 기본 항
-    if isinstance(Xt, np.ndarray):
-        Xt = torch.from_numpy(Xt.astype(np.float32))
-    
-    Xdot = torch.roll(Xt, 1, dims=1) * (torch.roll(Xt, -1, dims=1) - torch.roll(Xt, 2, dims=1)) - Xt + F
-    
-    # Memory term 추가
-    memory_term = forward_pass_10(
-        Xt, Xth1, Xth2, Xth3, Xth4, Xth5, Xth6, Xth7, Xth8, Xth9, Xth10,
-        model, sigma_X, mu_X
-    )
-    
-    # 텐서 덧셈
-    Xdot = Xdot + memory_term
-    
-    return Xdot  # numpy로 변환하지 않고 tensor 반환
+    assert Xt.shape[1] == 6, "Xt should have shape [batch, 6, K] for 2-point memory"
 
+    past_X2    = Xt[:, -6, :]  # t-2
+    past_X1    = Xt[:, -4, :]  # t-1
+    current_X  = Xt[:, -2, :]  # t
 
-def stepper_10(Xt, model, F, sigma_X, mu_X, dt):
-    """
-    Xt: (batch_size, 2*n_hist+2, K)
-    model: LSTMMemoryNetwork 인스턴스
-    F: float
-    sigma_X: (K,)
-    mu_X: (K,)
-    dt: float
+    # RK4 계산
+    Xdot1 = L96_2t_xdot_2(current_X, past_X1, past_X2, model, F, sigma_X, mu_X, is_eval)
+    Xdot2 = L96_2t_xdot_2(current_X + 0.5 * dt * Xdot1, past_X1, past_X2, model, F, sigma_X, mu_X, is_eval)
+    Xdot3 = L96_2t_xdot_2(current_X + 0.5 * dt * Xdot2, past_X1, past_X2, model, F, sigma_X, mu_X, is_eval)
+    Xdot4 = L96_2t_xdot_2(current_X + dt * Xdot3, past_X1, past_X2, model, F, sigma_X, mu_X, is_eval)
 
-    RK4 방법으로 DDE를 적분하여 현재 시점의 state X를 계산
-    """
-    # 과거 상태 추출
-    past_X10 = Xt[:,-22,:]  # t-10 시점
-    past_X9 = Xt[:,-20,:]   # t-9 시점
-    past_X8 = Xt[:,-18,:]   # t-8 시점
-    past_X7 = Xt[:,-16,:]   # t-7 시점
-    past_X6 = Xt[:,-14,:]   # t-6 시점
-    past_X5 = Xt[:,-12,:]   # t-5 시점
-    past_X4 = Xt[:,-10,:]   # t-4 시점
-    past_X3 = Xt[:,-8,:]    # t-3 시점
-    past_X2 = Xt[:,-6,:]    # t-2 시점
-    past_X1 = Xt[:,-4,:]    # t-1 시점
-    current_X = Xt[:,-2,:]  # 현재 시점
+    X_future = current_X + (dt / 6.0) * (Xdot1 + Xdot4 + 2.0 * (Xdot2 + Xdot3))
 
-    # RK4 방법
-    Xdot1 = L96_2t_xdot_10(current_X, past_X1, past_X2, past_X3, past_X4, past_X5,
-                           past_X6, past_X7, past_X8, past_X9, past_X10,
-                           model, F, sigma_X, mu_X)
-    
-    Xdot2 = L96_2t_xdot_10(current_X + 0.5 * dt * Xdot1,
-                           past_X1, past_X2, past_X3, past_X4, past_X5,
-                           past_X6, past_X7, past_X8, past_X9, past_X10,
-                           model, F, sigma_X, mu_X)
-    
-    Xdot3 = L96_2t_xdot_10(current_X + 0.5 * dt * Xdot2,
-                           past_X1, past_X2, past_X3, past_X4, past_X5,
-                           past_X6, past_X7, past_X8, past_X9, past_X10,
-                           model, F, sigma_X, mu_X)
-    
-    Xdot4 = L96_2t_xdot_10(current_X + dt * Xdot3,
-                           current_X, past_X1, past_X2, past_X3, past_X4,
-                           past_X5, past_X6, past_X7, past_X8, past_X9,
-                           model, F, sigma_X, mu_X)
-
-    # 최종 상태 계산
-    X_future = current_X + (dt / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-    
     return X_future
 
-# =============================================================================
-# 평가 및 외삽용 함수
-# =============================================================================
-def evaluate_forward_pass_2(Xt, Xth1, Xth2, model, sigma_X, mu_X):
-    """
-    LSTM을 사용한 forward pass 평가 함수
-        
-        Args:
-        Xt (torch.Tensor/np.ndarray): 현재 시점의 상태
-        Xth1 (torch.Tensor/np.ndarray): t-1 시점의 상태
-        Xth2 (torch.Tensor/np.ndarray): t-2 시점의 상태
-        model (LSTMMemoryNetwork): 학습된 LSTM 모델
-        sigma_X (torch.Tensor/np.ndarray): 정규화를 위한 표준편차
-        mu_X (torch.Tensor/np.ndarray): 정규화를 위한 평균
 
-        Returns:
-        torch.Tensor: 모델 예측값 (역정규화된 상태)
+def stepper_10(Xt, model, F, sigma_X, mu_X, dt, is_eval=False):
     """
-    # numpy 입력을 tensor로 변환
-    if isinstance(Xt, np.ndarray):
-        Xt = torch.from_numpy(Xt.astype(np.float32))
-        Xth1 = torch.from_numpy(Xth1.astype(np.float32))
-        Xth2 = torch.from_numpy(Xth2.astype(np.float32))
-        
-    if isinstance(sigma_X, np.ndarray):
-        sigma_X = torch.from_numpy(sigma_X.astype(np.float32))
-        mu_X = torch.from_numpy(mu_X.astype(np.float32))
+    RK4 방법으로 다음 시점 상태 계산 (10개 시점 기반 DDE)
+    - Xt: [batch, 22, K] → t-20 ~ t 까지 포함
+    """
+    assert Xt.shape[1] == 22, "Xt should have shape [batch, 22, K] for 10-point memory"
+
+    current_X = Xt[:, -2, :]  # t 시점 값
+
+    # RK4 계산
+    Xdot1 = L96_2t_xdot_10(current_X, Xt, model, F, sigma_X, mu_X, is_eval)
+    Xdot2 = L96_2t_xdot_10(current_X + 0.5 * dt * Xdot1, Xt, model, F, sigma_X, mu_X, is_eval)
+    Xdot3 = L96_2t_xdot_10(current_X + 0.5 * dt * Xdot2, Xt, model, F, sigma_X, mu_X, is_eval)
+    Xdot4 = L96_2t_xdot_10(current_X + dt * Xdot3, Xt, model, F, sigma_X, mu_X, is_eval)
+
+    X_future = current_X + (dt / 6.0) * (Xdot1 + Xdot4 + 2.0 * (Xdot2 + Xdot3))
+    return X_future
+
+def L96_2t_xdot_10(Xt, X_seq, model, F, sigma_X, mu_X, is_eval=False):
+    """
+    Lorenz 96 시스템의 시간 미분 계산 (10개 시점 기반 memory term 사용)
+    - Xt: [batch, K] (현재 시점)
+    - X_seq: [batch, 22, K] (t-20 ~ t)
+    """
+    core_term = torch.roll(Xt, 1, dims=1) * (torch.roll(Xt, -1, dims=1) - torch.roll(Xt, 2, dims=1)) - Xt + F
+    memory_term = forward_pass_10(X_seq, model, sigma_X, mu_X, is_eval=is_eval)
+
+    return core_term + memory_term
+
+def forward_pass_10(X_seq, model, sigma_X, mu_X, is_eval=False):
+    """
+    LSTM을 사용한 forward pass 함수 (10개 과거 시점)
+    - X_seq: [batch_size, 2*n_hist+2=22, K]
+    - 정규화 + 시퀀스 구성 + LSTM 예측
+    """
+    eps = 1e-6
+
+    # gradient 계산을 위해 requires_grad=True 설정
+    X_seq = X_seq.float().requires_grad_(True)
     
-    # 평가 모드로 설정
-    model.eval()
+    # 최근 11개 시점 추출: t-10 ~ t
+    recent_seq = X_seq[:, -11:, :]  # shape: [B, 11, K]
     
-    with torch.no_grad():
-        # 정규화
-        H = (Xt - mu_X) / sigma_X
-        Hh1 = (Xth1 - mu_X) / sigma_X
-        Hh2 = (Xth2 - mu_X) / sigma_X
-        
-        # LSTM 입력을 위한 시퀀스 구성 (과거→현재 순서)
-        sequence = torch.stack([Hh2, Hh1, H], dim=1)
-        
-        # LSTM forward pass
-        output = model(sequence)
-        
-        # 역정규화
-        output = output * sigma_X + mu_X
-        
-    return output
+    # 정규화
+    seq_norm = (recent_seq - mu_X) / (sigma_X + eps)
+    seq_norm = torch.clamp(seq_norm, -5.0, 5.0)  # 안정화
+
+    # 모델 예측
+    if is_eval:
+        model.eval()
+        with torch.no_grad():
+            output = model(seq_norm)
+    else:
+        output = model(seq_norm)
+
+    # 역정규화
+    output = output * sigma_X + mu_X
+    return output  # detach 제거
 
 
-
-def evaluate_L96_2t_xdot_2(Xt, Xth1, Xth2, model, F, sigma_X, mu_X):    
-    """
-    LSTM 모델을 사용한 Lorenz 96 시스템의 시간 미분 계산
-    """
-    if isinstance(Xt, np.ndarray):
-        Xt = torch.from_numpy(Xt.astype(np.float32))
-        Xth1 = torch.from_numpy(Xth1.astype(np.float32))
-        Xth2 = torch.from_numpy(Xth2.astype(np.float32))
-    
-    # Lorenz 96 시스템의 기본 항
-    Xdot = torch.roll(Xt, 1, dims=1) * (torch.roll(Xt, -1, dims=1) - torch.roll(Xt, 2, dims=1)) - Xt + F
-    
-    # Memory term 추가
-    memory_term = evaluate_forward_pass_2(Xt, Xth1, Xth2, model, sigma_X, mu_X)
-    
-    # 텐서 덧셈
-    Xdot = Xdot + memory_term
-    
-    return Xdot  # numpy로 변환하지 않고 tensor 반환
 
 def integrate_L96_2t_with_NN_2(X0, si, nt, model, F, sigma_X, mu_X, t0=0, dt=0.001):
     xhist = []
-    X = torch.from_numpy(X0.copy().astype(np.float32))  # 초기부터 tensor로 변환
-    xhist.append(X[0,:])
-    for i in range(X.shape[0]-1):
-        xhist.append(X[i+1,:])
-    
-    ns = 1
-    for n in range(nt):
-        if n%50 == 0:
-            print(n,nt)
-        for s in range(ns):
-            # 현재 상태를 tensor로 유지
-            x_current = xhist[-2][None,:]
-            
-            # RK4 update of X (모든 연산을 tensor로 수행)
-            Xdot1 = evaluate_L96_2t_xdot_2(
-                x_current, 
-                xhist[-4][None,:], 
-                xhist[-6][None,:], 
-                model, F, sigma_X, mu_X)
-            
-            Xdot2 = evaluate_L96_2t_xdot_2(
-                x_current + 0.5 * dt * Xdot1, 
-                xhist[-3][None,:], 
-                xhist[-5][None,:],
-                model, F, sigma_X, mu_X)
-            
-            Xdot3 = evaluate_L96_2t_xdot_2(
-                x_current + 0.5 * dt * Xdot2,
-                xhist[-3][None,:], 
-                xhist[-5][None,:],
-                model, F, sigma_X, mu_X)
-            
-            Xdot4 = evaluate_L96_2t_xdot_2(
-                x_current + dt * Xdot3,
-                xhist[-2][None,:], 
-                xhist[-4][None,:],
-                model, F, sigma_X, mu_X)
-            
-            # 모든 연산을 tensor로 수행
-            X = x_current + (dt / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-            
-        xhist.append(X[0,:])
-    
-    # 마지막에 numpy로 변환하여 반환
+    X = torch.from_numpy(X0.astype(np.float32))  # 초기 입력 [2n_hist+2, K]
+    for i in range(X.shape[0]):
+        xhist.append(X[i])
+
+    for _ in range(nt):
+        Xt = torch.stack(xhist[-2:])          # t
+        Xth1 = xhist[-4]                       # t-1
+        Xth2 = xhist[-6]                       # t-2
+
+        x_current = Xt[-1].unsqueeze(0)        # [1, K]
+
+        # RK4 update
+        Xdot1 = L96_2t_xdot_2(x_current, Xth1.unsqueeze(0), Xth2.unsqueeze(0), model, F, sigma_X, mu_X, is_eval=True)
+        Xdot2 = L96_2t_xdot_2(x_current + 0.5 * dt * Xdot1, Xth1.unsqueeze(0), Xth2.unsqueeze(0), model, F, sigma_X, mu_X, is_eval=True)
+        Xdot3 = L96_2t_xdot_2(x_current + 0.5 * dt * Xdot2, Xth1.unsqueeze(0), Xth2.unsqueeze(0), model, F, sigma_X, mu_X, is_eval=True)
+        Xdot4 = L96_2t_xdot_2(x_current + dt * Xdot3, Xth1.unsqueeze(0), Xth2.unsqueeze(0), model, F, sigma_X, mu_X, is_eval=True)
+
+        X_next = x_current + (dt / 6.0) * (Xdot1 + Xdot4 + 2.0 * (Xdot2 + Xdot3))
+        xhist.append(X_next.squeeze(0))
+
     return torch.stack(xhist).detach().numpy()
 
 
-
-def evaluate_forward_pass_10(Xt, Xth1, Xth2, Xth3, Xth4, Xth5, Xth6, Xth7, Xth8, Xth9, Xth10, model, sigma_X, mu_X):
-    """
-    LSTM을 사용한 forward pass 평가 함수 (10개의 과거 시점 사용)
-    
-    Args:
-        Xt, Xth1~Xth10 (torch.Tensor/np.ndarray): 현재 및 과거 10개 시점의 상태
-        model (LSTMMemoryNetwork): 학습된 LSTM 모델
-        sigma_X (torch.Tensor/np.ndarray): 정규화를 위한 표준편차
-        mu_X (torch.Tensor/np.ndarray): 정규화를 위한 평균
-    
-    Returns:
-        torch.Tensor: 모델 예측값 (역정규화된 상태)
-    """
-    # numpy 입력을 tensor로 변환
-    if isinstance(Xt, np.ndarray):
-        Xt = torch.from_numpy(Xt.astype(np.float32))
-        Xth1 = torch.from_numpy(Xth1.astype(np.float32))
-        Xth2 = torch.from_numpy(Xth2.astype(np.float32))
-        Xth3 = torch.from_numpy(Xth3.astype(np.float32))
-        Xth4 = torch.from_numpy(Xth4.astype(np.float32))
-        Xth5 = torch.from_numpy(Xth5.astype(np.float32))
-        Xth6 = torch.from_numpy(Xth6.astype(np.float32))
-        Xth7 = torch.from_numpy(Xth7.astype(np.float32))
-        Xth8 = torch.from_numpy(Xth8.astype(np.float32))
-        Xth9 = torch.from_numpy(Xth9.astype(np.float32))
-        Xth10 = torch.from_numpy(Xth10.astype(np.float32))
-        
-    if isinstance(sigma_X, np.ndarray):
-        sigma_X = torch.from_numpy(sigma_X.astype(np.float32))
-        mu_X = torch.from_numpy(mu_X.astype(np.float32))
-    
-    # 평가 모드로 설정
-    model.eval()
-    
-    with torch.no_grad():
-        # 정규화
-        H = (Xt - mu_X) / sigma_X
-        Hh1 = (Xth1 - mu_X) / sigma_X
-        Hh2 = (Xth2 - mu_X) / sigma_X
-        Hh3 = (Xth3 - mu_X) / sigma_X
-        Hh4 = (Xth4 - mu_X) / sigma_X
-        Hh5 = (Xth5 - mu_X) / sigma_X
-        Hh6 = (Xth6 - mu_X) / sigma_X
-        Hh7 = (Xth7 - mu_X) / sigma_X
-        Hh8 = (Xth8 - mu_X) / sigma_X
-        Hh9 = (Xth9 - mu_X) / sigma_X
-        Hh10 = (Xth10 - mu_X) / sigma_X
-        
-        # LSTM 입력을 위한 시퀀스 구성 (과거→현재 순서)
-        sequence = torch.stack([
-            Hh10, Hh9, Hh8, Hh7, Hh6,
-            Hh5, Hh4, Hh3, Hh2, Hh1,
-            H
-        ], dim=1)
-        
-        # LSTM forward pass
-        output = model(sequence)
-        
-        # 역정규화
-        output = output * sigma_X + mu_X
-        
-    return output
-
-
-
-def evaluate_L96_2t_xdot_10(Xt, Xth1, Xth2, Xth3, Xth4, Xth5, Xth6, Xth7, Xth8, Xth9, Xth10, model, sigma_X, mu_X, F):    
-    """
-    LSTM 모델을 사용한 Lorenz 96 시스템의 시간 미분 계산 (10개 과거 시점 사용)
-    """
-    # numpy 입력을 float32 tensor로 변환
-    if isinstance(Xt, np.ndarray):
-        Xt = torch.from_numpy(Xt.astype(np.float32))
-    
-    # Lorenz 96 시스템의 기본 항
-    Xdot = torch.roll(Xt, 1, dims=1) * (torch.roll(Xt, -1, dims=1) - torch.roll(Xt, 2, dims=1)) - Xt + F
-    
-    # Memory term 추가
-    memory_term = evaluate_forward_pass_10(
-        Xt, Xth1, Xth2, Xth3, Xth4, Xth5, Xth6, Xth7, Xth8, Xth9, Xth10,
-        model, sigma_X, mu_X
-    )
-    
-    # 텐서 덧셈
-    Xdot = Xdot + memory_term
-    
-    return Xdot
-
 def integrate_L96_2t_with_NN_10(X0, si, nt, model, F, sigma_X, mu_X, t0=0, dt=0.001):
-    """
-    10개의 과거 시점을 사용하는 LSTM 모델을 이용한 Lorenz 96 시스템 적분
-    """
     xhist = []
-    X = torch.from_numpy(X0.copy().astype(np.float32))  # 초기부터 tensor로 변환
-    xhist.append(X[0,:])
-    for i in range(X.shape[0]-1):
-        xhist.append(X[i+1,:])
-    
-    ns = 1
-    for n in range(nt):
-        if n%50 == 0:
-            print(n,nt)
-        for s in range(ns):
-            # RK4 update of X
-            Xdot1 = evaluate_L96_2t_xdot_10(
-                xhist[-2][None,:], xhist[-4][None,:], xhist[-6][None,:], xhist[-8][None,:], xhist[-10][None,:],
-                xhist[-12][None,:], xhist[-14][None,:], xhist[-16][None,:], xhist[-18][None,:], xhist[-20][None,:],
-                xhist[-22][None,:], model, sigma_X, mu_X, F
-            )
-            
-            Xdot2 = evaluate_L96_2t_xdot_10(
-                xhist[-2][None,:] + 0.5 * dt * Xdot1, xhist[-3][None,:], xhist[-5][None,:], xhist[-7][None,:],
-                xhist[-9][None,:], xhist[-11][None,:], xhist[-13][None,:], xhist[-15][None,:], xhist[-17][None,:],
-                xhist[-19][None,:], xhist[-21][None,:], model, sigma_X, mu_X, F
-            )
-            
-            Xdot3 = evaluate_L96_2t_xdot_10(
-                xhist[-2][None,:] + 0.5 * dt * Xdot2, xhist[-3][None,:], xhist[-5][None,:], xhist[-7][None,:],
-                xhist[-9][None,:], xhist[-11][None,:], xhist[-13][None,:], xhist[-15][None,:], xhist[-17][None,:],
-                xhist[-19][None,:], xhist[-21][None,:], model, sigma_X, mu_X, F
-            )
-            
-            Xdot4 = evaluate_L96_2t_xdot_10(
-                xhist[-2][None,:] + dt * Xdot3, xhist[-2][None,:], xhist[-4][None,:], xhist[-6][None,:],
-                xhist[-8][None,:], xhist[-10][None,:], xhist[-12][None,:], xhist[-14][None,:], xhist[-16][None,:],
-                xhist[-18][None,:], xhist[-20][None,:], model, sigma_X, mu_X, F
-            )
-            
-            X = xhist[-2][None,:] + (dt / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-            
-        xhist.append(X[0,:])
-    
-    # 마지막에 numpy로 변환하여 반환
+    X = torch.from_numpy(X0.astype(np.float32))  # 초기 입력 [2n_hist+2, K]
+    for i in range(X.shape[0]):
+        xhist.append(X[i])
+
+    for _ in range(nt):
+        X_seq = torch.stack(xhist[-22:]).unsqueeze(0)   # [1, 22, K]
+        current_X = X_seq[:, -2, :]                     # [1, K]
+
+        # RK4 update
+        Xdot1 = L96_2t_xdot_10(current_X, X_seq, model, F, sigma_X, mu_X, is_eval=True)
+        Xdot2 = L96_2t_xdot_10(current_X + 0.5 * dt * Xdot1, X_seq, model, F, sigma_X, mu_X, is_eval=True)
+        Xdot3 = L96_2t_xdot_10(current_X + 0.5 * dt * Xdot2, X_seq, model, F, sigma_X, mu_X, is_eval=True)
+        Xdot4 = L96_2t_xdot_10(current_X + dt * Xdot3, X_seq, model, F, sigma_X, mu_X, is_eval=True)
+
+        X_next = current_X + (dt / 6.0) * (Xdot1 + Xdot4 + 2.0 * (Xdot2 + Xdot3))
+        xhist.append(X_next.squeeze(0))
+
     return torch.stack(xhist).detach().numpy()
 
 
@@ -742,7 +491,7 @@ if __name__ == "__main__":
         }
     }, model_save_path)
     print(f'모델이 저장되었습니다: {model_save_path}')
-    
+
     # Evaluation
     # 평가를 위한 모델 로드
     checkpoint = torch.load(model_save_path)
@@ -783,7 +532,7 @@ if __name__ == "__main__":
         Xth2_dt = X_int2dt[:-2,:]
         
         # 모델 출력 계산
-        NN_out = evaluate_forward_pass_2(Xt_dt, Xth1_dt, Xth2_dt, eval_model, sigma_X, mu_X)
+        NN_out = forward_pass_2(Xt_dt, Xth1_dt, Xth2_dt, eval_model, sigma_X, mu_X)
         Xpred_int = integrate_L96_2t_with_NN_2(X_int[0:2*n_hist+2,:], si, nt-2*n_hist-1, eval_model, F, sigma_X, mu_X, 0, 2*dt)
     else:
         # 10개 과거 시점용 데이터 준비
@@ -799,12 +548,28 @@ if __name__ == "__main__":
         Xth9_dt = X_int2dt[1:-9,:]
         Xth10_dt = X_int2dt[:-10,:]
         
+        # 10개 과거 시점용 데이터 준비
+        # numpy 배열을 tensor로 변환
+        Xt_dt = torch.from_numpy(Xt_dt).float()
+        Xth1_dt = torch.from_numpy(Xth1_dt).float()
+        Xth2_dt = torch.from_numpy(Xth2_dt).float()
+        Xth3_dt = torch.from_numpy(Xth3_dt).float()
+        Xth4_dt = torch.from_numpy(Xth4_dt).float()
+        Xth5_dt = torch.from_numpy(Xth5_dt).float()
+        Xth6_dt = torch.from_numpy(Xth6_dt).float()
+        Xth7_dt = torch.from_numpy(Xth7_dt).float()
+        Xth8_dt = torch.from_numpy(Xth8_dt).float()
+        Xth9_dt = torch.from_numpy(Xth9_dt).float()
+        Xth10_dt = torch.from_numpy(Xth10_dt).float()
+        
+        X_seq = torch.stack([
+            Xth10_dt, Xth9_dt, Xth8_dt, Xth7_dt, Xth6_dt,
+            Xth5_dt, Xth4_dt, Xth3_dt, Xth2_dt, Xth1_dt,
+            Xt_dt
+        ], dim=1)  # [N, 11, K] 형태로 변환
+        
         # 모델 출력 계산
-        NN_out = evaluate_forward_pass_10(
-            Xt_dt, Xth1_dt, Xth2_dt, Xth3_dt, Xth4_dt, 
-            Xth5_dt, Xth6_dt, Xth7_dt, Xth8_dt, Xth9_dt, 
-            Xth10_dt, eval_model, sigma_X, mu_X
-        )
+        NN_out = forward_pass_10(X_seq, eval_model, sigma_X, mu_X)
         Xpred_int = integrate_L96_2t_with_NN_10(X_int[0:2*n_hist+2,:], si, nt-2*n_hist-1, eval_model, F, sigma_X, mu_X, 0, 2*dt)
 
     print("NN_out.shape", NN_out.shape)
@@ -849,7 +614,7 @@ if __name__ == "__main__":
         Xth2_dt = X_ext2dt[:-2,:]
         
         # 모델 출력 계산
-        NN_out_ext = evaluate_forward_pass_2(Xt_dt, Xth1_dt, Xth2_dt, eval_model, sigma_X, mu_X)
+        NN_out_ext = forward_pass_2(Xt_dt, Xth1_dt, Xth2_dt, eval_model, sigma_X, mu_X)
         Xpred_ext = integrate_L96_2t_with_NN_2(Xpred_init, si, nt, eval_model, F, sigma_X, mu_X, 0, 2*dt)
     else:
         # 10개 과거 시점용 데이터 준비
@@ -865,12 +630,28 @@ if __name__ == "__main__":
         Xth9_dt = X_ext2dt[1:-9,:]
         Xth10_dt = X_ext2dt[:-10,:]
         
+        # 10개 과거 시점용 데이터 준비
+        # numpy 배열을 tensor로 변환
+        Xt_dt = torch.from_numpy(Xt_dt).float()
+        Xth1_dt = torch.from_numpy(Xth1_dt).float()
+        Xth2_dt = torch.from_numpy(Xth2_dt).float()
+        Xth3_dt = torch.from_numpy(Xth3_dt).float()
+        Xth4_dt = torch.from_numpy(Xth4_dt).float()
+        Xth5_dt = torch.from_numpy(Xth5_dt).float()
+        Xth6_dt = torch.from_numpy(Xth6_dt).float()
+        Xth7_dt = torch.from_numpy(Xth7_dt).float()
+        Xth8_dt = torch.from_numpy(Xth8_dt).float()
+        Xth9_dt = torch.from_numpy(Xth9_dt).float()
+        Xth10_dt = torch.from_numpy(Xth10_dt).float()
+        
+        X_seq = torch.stack([
+            Xth10_dt, Xth9_dt, Xth8_dt, Xth7_dt, Xth6_dt,
+            Xth5_dt, Xth4_dt, Xth3_dt, Xth2_dt, Xth1_dt,
+            Xt_dt
+        ], dim=1)  # [N, 11, K] 형태로 변환
+        
         # 모델 출력 계산
-        NN_out_ext = evaluate_forward_pass_10(
-            Xt_dt, Xth1_dt, Xth2_dt, Xth3_dt, Xth4_dt, 
-            Xth5_dt, Xth6_dt, Xth7_dt, Xth8_dt, Xth9_dt, 
-            Xth10_dt, eval_model, sigma_X, mu_X
-        )
+        NN_out_ext = forward_pass_10(X_seq, eval_model, sigma_X, mu_X)
         Xpred_ext = integrate_L96_2t_with_NN_10(Xpred_init, si, nt, eval_model, F, sigma_X, mu_X, 0, 2*dt)
 
     print("NN_out_ext.shape", NN_out_ext.shape)
@@ -901,16 +682,17 @@ if __name__ == "__main__":
     print('Relative extrapolation norm det: ',err_ext_det)
     print('Relative extrapolation norm Closure det: ',err_ext_NN_det)
 
+    # 결과 저장
     np.save(fold+'/X_pred_int_det', Xpred_int)
     np.save(fold+'/X_int_det', X_int)
-    np.save(fold+'/NN_int_det', NN_out)
+    np.save(fold+'/NN_int_det', NN_out.detach().numpy())
     np.save(fold+'/exact_out_int_det', exact_out_int)
     np.save(fold+'/t_det', t)
     np.save(fold+'/t_2dt_det', t_2dt)
     
     np.save(fold+'/X_pred_ext_det', Xpred_ext)
     np.save(fold+'/X_ext_det', X_ext)
-    np.save(fold+'/NN_ext_det', NN_out_ext)
+    np.save(fold+'/NN_ext_det', NN_out_ext.detach().numpy())
     np.save(fold+'/exact_out_ext_det', exact_out_ext)
     np.save(fold+'/t_ext_det', t_ext)
     np.save(fold+'/t_2dt_ext_det', t_2dt_ext)
