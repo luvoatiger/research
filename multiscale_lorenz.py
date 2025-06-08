@@ -6,7 +6,6 @@ https://www.ecmwf.int/en/elibrary/10829-predictability-problem-partly-solved
 
 import os
 import numpy as np
-
 from numba import jit, njit
 from tqdm import tqdm
 
@@ -232,16 +231,19 @@ def integrate_L96_2t_with_coupling(X0, Y0, si, nt, F, h, b, c, t0=0, dt=0.001):
         plt.plot( t, X);
     """
 
-    time, xhist, yhist, xytend_hist = (
+    time, xhist, yhist, xytend_hist, dxdt = (
         t0 + np.zeros((nt + 1)),
         np.zeros((nt + 1, len(X0))),
         np.zeros((nt + 1, len(Y0))),
         np.zeros((nt + 1, len(X0))),
+        np.zeros((nt + 1, len(X0))),
     )
     X, Y = X0.copy(), Y0.copy()
+
     xhist[0, :] = X
     yhist[0, :] = Y
     xytend_hist[0, :] = 0
+    dxdt[0, :] = 0
     if si < dt:
         dt, ns = si, 1
     else:
@@ -266,13 +268,14 @@ def integrate_L96_2t_with_coupling(X0, Y0, si, nt, F, h, b, c, t0=0, dt=0.001):
             X = X + (dt / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
             Y = Y + (dt / 6.0) * ((Ydot1 + Ydot4) + 2.0 * (Ydot2 + Ydot3))
 
-        xhist[n + 1], yhist[n + 1], time[n + 1], xytend_hist[n + 1] = (
+        xhist[n + 1], yhist[n + 1], time[n + 1], xytend_hist[n + 1], dxdt[n + 1] = (
             X,
             Y,
             t0 + si * (n + 1),
             XYtend,
+            Xdot1,
         )
-    return xhist, yhist, time, xytend_hist
+    return xhist, yhist, time, xytend_hist, dxdt
 
 def s(k, K):
     """A non-dimension coordinate from -1..+1 corresponding to k=0..K"""
@@ -471,7 +474,7 @@ class L96:
         If return_coupling=True, returns C in addition to X,Y,t.
         Returns sampled history: X[:,:],Y[:,:],t[:],C[:,:]."""
         nt = int(T / si)
-        X, Y, t, C = integrate_L96_2t_with_coupling(
+        X, Y, t, C, dxdt = integrate_L96_2t_with_coupling(
             self.X,
             self.Y,
             si,
@@ -484,12 +487,11 @@ class L96:
             dt=self.dt,
         )
         if store:
-            print(f"\nt : {self.t, t[-1]}")
             self.X, self.Y, self.t = X[-1], Y[-1], t[-1]
         if return_coupling:
-            return X, Y, t, C
+            return X, Y, t, dxdt, C
         else:
-            return X, Y, t
+            return X, Y, t, dxdt
 
     
 if __name__ == "__main__":
@@ -500,7 +502,7 @@ if __name__ == "__main__":
     h = 1.0  # Coupling coefficient
     b = 10    # Ratio of amplitudes
 
-    si, dt = 0.05, 0.05  # Sampling time interval
+    si, dt = 0.005, 0.005  # Sampling time interval
     
     c = 10    # time-scale ratio 설정
 
@@ -517,7 +519,7 @@ if __name__ == "__main__":
     all_Y = np.zeros((num_ic, time_steps_per_ic, J * K))
     all_t = np.zeros((num_ic, time_steps_per_ic))
     all_C = np.zeros((num_ic, time_steps_per_ic, K))
-    
+    all_dxdt = np.zeros((num_ic, time_steps_per_ic, K))
     ic_X = np.zeros((num_ic, K))
     ic_Y = np.zeros((num_ic, J * K))
 
@@ -538,23 +540,24 @@ if __name__ == "__main__":
         ic_Y[i] = model.Y
 
         # 3 MTU 동안 스핀업 실행 및 spinup 상태 저장
-        X_spinup, Y_spinup, t_spinup, C_spinup = model.run(si, spinup_time, store=True, return_coupling=True)
+        X_spinup, Y_spinup, t_spinup, dxdt_spinup, C_spinup = model.run(si, spinup_time, store=True, return_coupling=True)
         spinup_X[i] = model.X
         spinup_Y[i] = model.Y
         
         # t = 0으로 초기화 한 후, 10 MTU 동안 적분 후 마지막 상태 저장
         model.t = 0
-        X_forecast, Y_forecast, t_forecast, C_forecast = model.run(si, forecast_time, store=True, return_coupling=True)
+        X_forecast, Y_forecast, t_forecast, dxdt_forecast, C_forecast = model.run(si, forecast_time, store=True, return_coupling=True)
         
         # 적분 결과 저장
         all_X[i] = X_forecast
         all_Y[i] = Y_forecast
         all_t[i] = t_forecast
         all_C[i] = C_forecast
-
+        all_dxdt[i] = dxdt_forecast
         # 초기화
         model.randomize_IC()
 
+    print(all_X.shape, all_Y.shape, all_t.shape, all_C.shape, all_dxdt.shape)
     print("\n모든 초기 조건 처리 완료!")
 
     # 실행 시간 측정
@@ -575,13 +578,15 @@ if __name__ == "__main__":
         end_idx = min((batch + 1) * batch_size, num_ic)
         
         # 각 배치의 데이터 저장
-        np.save(f"{results_dir}/X_batch_{batch+1}_10dt.npy", all_X[start_idx:end_idx])
-        np.save(f"{results_dir}/Y_batch_{batch+1}_10dt.npy", all_Y[start_idx:end_idx])
-        np.save(f"{results_dir}/t_batch_{batch+1}_10dt.npy", all_t[start_idx:end_idx])
-        np.save(f"{results_dir}/C_batch_{batch+1}_10dt.npy", all_C[start_idx:end_idx])
+        np.save(f"{results_dir}/X_batch_{batch+1}.npy", all_X[start_idx:end_idx])
+        np.save(f"{results_dir}/Y_batch_{batch+1}.npy", all_Y[start_idx:end_idx])
+        np.save(f"{results_dir}/t_batch_{batch+1}.npy", all_t[start_idx:end_idx])
+        np.save(f"{results_dir}/C_batch_{batch+1}.npy", all_C[start_idx:end_idx])
+        np.save(f"{results_dir}/dxdt_batch_{batch+1}.npy", all_dxdt[start_idx:end_idx])
+
     # 초기 조건 저장
-    np.save(f"{results_dir}/ic_X_10dt.npy", ic_X)
-    np.save(f"{results_dir}/ic_Y_10dt.npy", ic_Y)
+    np.save(f"{results_dir}/ic_X.npy", ic_X)
+    np.save(f"{results_dir}/ic_Y.npy", ic_Y)
 
     # 메타데이터 저장
     metadata = {
@@ -602,7 +607,7 @@ if __name__ == "__main__":
         'batch_size': batch_size
     }
     import json
-    with open(f"{results_dir}/metadata_10dt.json", "w") as f:
+    with open(f"{results_dir}/metadata.json", "w") as f:
         json.dump(metadata, f)
 
     print(f"\n데이터가 {results_dir} 디렉토리에 저장되었습니다.")
