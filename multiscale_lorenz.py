@@ -276,7 +276,7 @@ def integrate_L96_2t_with_coupling(X0, Y0, si, nt, F, h, b, c, t0=0, dt=0.001):
 
 def s(k, K):
     """A non-dimension coordinate from -1..+1 corresponding to k=0..K"""
-    return 2 * (0.5 + k) / K - 1
+    return 2 * k / K - 1
 
 
 # Class for convenience
@@ -493,22 +493,22 @@ class L96:
 
     
 if __name__ == "__main__":
-    # Kang's experimental setup
-    K = 36  # Number of globa-scale variables X
-    J = 10  # Number of local-scale Y variables per single global-scale X variable
-    F = 20  # Forcing
-    h = 1.0  # Coupling coefficient
-    b = 10    # Ratio of amplitudes
+    K = 8 # Number of globa-scale variables X
+    J = 32 # Number of local-scale Y variables per single global-scale X variable
+    F = 15.0 # Focring
+    b = 10.0 # ratio of amplitudes
+    c = 10.0 # time-scale ratio
+    h = 1.0 # Coupling coefficient
+    noise = 0.03
 
-    si, dt = 0.05, 0.05  # Sampling time interval
+    si = 0.005  # Sampling time interval
+    dt = 0.005  # Time step
     
-    c = 10    # time-scale ratio 설정
-
     print("\n=== Running Main Experiment ===")
 
     num_ic = 300  # 초기 조건 개수
     ic_interval = 10  # 적분의 마지막 포인트 이후 다음 적분을 시작할 초기 조건까지의 간격 (MTU)
-    forecast_time = 10  # 각 초기 조건 별 적분 기간 (MTU)
+    forecast_time = 100  # # Hist_Deterministic.py의 nt = 각 초기 조건 별 적분 기간 (MTU) (100 / 0.005 = 20000)
     
     # 데이터 저장을 위한 배열 초기화
     # 메모리 효율성을 위해 결과를 점진적으로 저장
@@ -526,11 +526,16 @@ if __name__ == "__main__":
     
     import time
     start_time = time.time()
-    
+    k = np.arange(K)
+    j = np.arange(J * K)
+
+    Xinit = s(k, K) * (s(k, K) - 1) * (s(k, K) + 1)
+    Yinit = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
+
     # 모델 초기화
     model = L96(K, J, F=F, h=h, b=b, c=c, dt=dt)
-    model.set_state(s(model.k, model.K) * (s(model.k, model.K) - 1) * (s(model.k, model.K) + 1), 0 * model.j)    
-    spinup_time = 3
+    model.set_state(Xinit, Yinit)    
+    spinup_time = 100 # Hist_Deterministic.py의 nt_pre = (100 / 0.005 = 20000)
 
     for i in tqdm(range(num_ic), desc="초기 조건 처리 중"):
         # 초기 조건 저장        
@@ -545,7 +550,7 @@ if __name__ == "__main__":
         # t = 0으로 초기화 한 후, 10 MTU 동안 적분 후 마지막 상태 저장
         model.t = 0
         X_forecast, Y_forecast, t_forecast, C_forecast = model.run(si, forecast_time, store=True, return_coupling=True)
-        
+        print(f"X_forecast: {X_forecast.shape}, Y_forecast: {Y_forecast.shape}, t_forecast: {t_forecast.shape}, C_forecast: {C_forecast.shape}")
         # 적분 결과 저장
         all_X[i] = X_forecast
         all_Y[i] = Y_forecast
@@ -575,13 +580,13 @@ if __name__ == "__main__":
         end_idx = min((batch + 1) * batch_size, num_ic)
         
         # 각 배치의 데이터 저장
-        np.save(f"{results_dir}/X_batch_{batch+1}_10dt.npy", all_X[start_idx:end_idx])
-        np.save(f"{results_dir}/Y_batch_{batch+1}_10dt.npy", all_Y[start_idx:end_idx])
-        np.save(f"{results_dir}/t_batch_{batch+1}_10dt.npy", all_t[start_idx:end_idx])
-        np.save(f"{results_dir}/C_batch_{batch+1}_10dt.npy", all_C[start_idx:end_idx])
+        np.save(f"{results_dir}/X_batch_{batch+1}.npy", all_X[start_idx:end_idx])
+        np.save(f"{results_dir}/Y_batch_{batch+1}.npy", all_Y[start_idx:end_idx])
+        np.save(f"{results_dir}/t_batch_{batch+1}.npy", all_t[start_idx:end_idx])
+        np.save(f"{results_dir}/C_batch_{batch+1}.npy", all_C[start_idx:end_idx])
     # 초기 조건 저장
-    np.save(f"{results_dir}/ic_X_10dt.npy", ic_X)
-    np.save(f"{results_dir}/ic_Y_10dt.npy", ic_Y)
+    np.save(f"{results_dir}/ic_X.npy", ic_X)
+    np.save(f"{results_dir}/ic_Y.npy", ic_Y)
 
     # 메타데이터 저장
     metadata = {
@@ -602,7 +607,7 @@ if __name__ == "__main__":
         'batch_size': batch_size
     }
     import json
-    with open(f"{results_dir}/metadata_10dt.json", "w") as f:
+    with open(f"{results_dir}/metadata.json", "w") as f:
         json.dump(metadata, f)
 
     print(f"\n데이터가 {results_dir} 디렉토리에 저장되었습니다.")
