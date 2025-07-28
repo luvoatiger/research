@@ -3,6 +3,8 @@ import sys
 import time
 import random
 import torch
+import torch.nn as nn
+import torch.optim as optim
 
 import numpy as np
 import pandas as pd
@@ -166,7 +168,7 @@ class ChaoticSystem:
             raise ValueError(f"Invalid selection mode: {self.selection_mode}")
 
     def create_random_training_dataset(self, all_trajectories, J0=5):
-        X_list, Y_list = [], []
+        Z_list, z_list = [], []
         input_len = self.memory_range_NM + 1
         total_len = self.memory_range_NM + 2
 
@@ -179,16 +181,16 @@ class ChaoticSystem:
             for start in start_indices:
                 Z_j_i = traj[start:start + input_len].reshape(-1)
                 z_j_i = traj[start + input_len]
-                X_list.append(Z_j_i)
-                Y_list.append(z_j_i)
+                Z_list.append(Z_j_i)
+                z_list.append(z_j_i)
 
-        X = np.array(X_list)
-        Y = np.array(Y_list)
-        print(f"[Random] X.shape = {X.shape}, Y.shape = {Y.shape}")
-        return X, Y
+        Z = np.array(Z_list)
+        z = np.array(z_list)
+        print(f"[Random] Z.shape = {Z.shape}, z.shape = {z.shape}")
+        return Z, z
 
     def create_deterministic_training_dataset(self, all_trajectories):
-        X_list, Y_list = [], []
+        Z_list, z_list = [], []
         input_len = self.memory_range_NM + 1
         total_len = self.memory_range_NM + 2
 
@@ -199,13 +201,13 @@ class ChaoticSystem:
             for start in range(max_start + 1):
                 Z_j_i = traj[start:start + input_len].reshape(-1)
                 z_j_i = traj[start + input_len]
-                X_list.append(Z_j_i)
-                Y_list.append(z_j_i)
+                Z_list.append(Z_j_i)
+                z_list.append(z_j_i)
 
-        X = np.array(X_list)
-        Y = np.array(Y_list)
-        print(f"[Deterministic] X.shape = {X.shape}, Y.shape = {Y.shape}")
-        return X, Y
+        Z = np.array(Z_list)
+        z = np.array(z_list)
+        print(f"[Deterministic] Z.shape = {Z.shape}, z.shape = {z.shape}")
+        return Z, z
 
 def simulate_and_plot_x1(chaotic_system, t_end=400, t_start_plot=200, delta=0.02, initial_condition=None):
     """
@@ -255,66 +257,259 @@ def simulate_and_plot_x1(chaotic_system, t_end=400, t_start_plot=200, delta=0.02
     plt.show()
 
 
-class dAMZ(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
+class dAMZ(nn.Module):
+    """
+    d-AMZ (deep Artificial Memory Zone) 신경망
+    논문 Section 3.3의 수식에 따른 구현
+    
+    Eq. (13): D = d × (n_M + 1)
+    Eq. (14): Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T ∈ R^D
+    Eq. (15): N(⋅; Θ) : R^D → R^d
+    Eq. (16): z^out = [Î + N] (Z^in)
+    Eq. (17): z_{n+1} = z_n + N(z_n, z_{n-1}, ..., z_{n-nM}; Θ), n ≥ n_M
+    """
+    
+    def __init__(self, d=3, n_M=60, hidden_dim=30):
+        """
+        dAMZ 신경망 초기화
+        
+        Args:
+            d (int): 축소된 변수의 차원 (기본값: 3, x1, x2, x3)
+            n_M (int): 메모리 항목 수 (memory_length_TM / dt)
+            hidden_dim (int): 은닉층 차원
+        """
         super(dAMZ, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
+        
+        self.d = d  # 축소된 변수 차원
+        self.n_M = n_M  # 메모리 항목 수
+        self.D = d * (n_M + 1)  # Eq. (13): D = d × (n_M + 1)
+        
+        # Î 행렬 정의: Î = [I_d, 0, ..., 0] (d × D)
+        # I_d는 (d × d) 단위행렬, n_M개의 (d × d) 영행렬과 연결
+        self.I_hat = torch.zeros(d, self.D)
+        self.I_hat[:d, :d] = torch.eye(d)  # 첫 번째 d×d 블록만 단위행렬
+        
+        # 신경망 N(⋅; Θ) 정의: R^D → R^d
+        self.neural_network = nn.Sequential(
+            nn.Linear(self.D, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, d)
+        )
+        
+        # 가중치 초기화
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        """가중치 초기화"""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.xavier_uniform_(module.weight, gain=0.1)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+    
+    def forward(self, Z_in):
+        """
+        Forward pass - Eq. (16)과 Eq. (17) 구현
+        
+        Args:
+            Z_in (torch.Tensor): 입력 텐서 [batch_size, D]
+                                Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
+        
+        Returns:
+            torch.Tensor: 출력 [batch_size, d] - z_{n+1}
+        """
+        batch_size = Z_in.shape[0]
+        
+        # Î 행렬을 배치 크기에 맞게 확장
+        I_hat_batch = self.I_hat.unsqueeze(0).expand(batch_size, -1, -1)  # [batch_size, d, D]
+        
+        # Z_in을 배치 차원에서 행렬로 변환
+        Z_in_matrix = Z_in.unsqueeze(2)  # [batch_size, D, 1]
+        
+        # Î × Z_in 계산 (z_n 추출)
+        z_n = torch.bmm(I_hat_batch, Z_in_matrix).squeeze(2)  # [batch_size, d]
+        
+        # 신경망 N(Z_in) 계산
+        N_output = self.neural_network(Z_in)  # [batch_size, d]
+        
+        # Eq. (16): z^out = [Î + N] (Z^in) = z_n + N(Z_in)
+        # Eq. (17): z_{n+1} = z_n + N(z_n, z_{n-1}, ..., z_{n-nM}; Θ)
+        z_out = z_n + N_output
+        
+        return z_out
+    
+    def get_memory_structure_info(self):
+        """메모리 구조 정보 반환"""
+        return {
+            'd': self.d,
+            'n_M': self.n_M,
+            'D': self.D,
+            'input_dim': self.D,
+            'output_dim': self.d
+        }
 
-    def forward(self, x):
-        pass
+
+def train_model(model, Z, z, epochs=2000, lr=1e-3):
+    """
+    dAMZ 모델 학습 함수
+    
+    Args:
+        model: dAMZ 모델
+        Z: 입력 데이터 [batch_size, D]
+        z: 타겟 데이터 [batch_size, d]
+        epochs: 학습 에포크 수
+        lr: 학습률
+    """
+    # 데이터를 텐서로 변환
+    Z_tensor = torch.FloatTensor(Z)
+    z_tensor = torch.FloatTensor(z)
+    
+    # 손실 함수와 옵티마이저 정의
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    # 학습
+    model.train()
+    losses = []
+    
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        
+        # 순전파
+        outputs = model(Z_tensor)
+        loss = criterion(outputs, z_tensor)
+        
+        # 역전파
+        loss.backward()
+        optimizer.step()
+        
+        losses.append(loss.item())
+        
+        if (epoch + 1) % 500 == 0:
+            print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.6f}')
+    
+    print(f'Training completed. Final loss: {losses[-1]:.6f}')
+    return losses
 
 
-# 예시 실행
+def simulate_and_plot_x1_prediction(model, chaotic_system, t_end=400, t_start_plot=200, delta=0.02):
+    """
+    모델 예측과 실제 시뮬레이션을 비교하여 x1을 시각화하는 함수
+    
+    Args:
+        model: 학습된 dAMZ 모델
+        chaotic_system: ChaoticSystem 인스턴스
+        t_end: 적분 끝 시간
+        t_start_plot: 시각화 시작 시간
+        delta: 시간 간격
+    """
+    # 초기 조건 설정
+    initial_condition = chaotic_system.sample_initial_conditions(1)[0]
+    
+    # 실제 시뮬레이션
+    t_eval = np.arange(0, t_end + delta, delta)
+    t_span = (0, t_end)
+    
+    sol = solve_ivp(
+        fun=chaotic_system.system_equations,
+        t_span=t_span,
+        y0=initial_condition,
+        t_eval=t_eval,
+        method='RK45',
+        rtol=1e-9,
+        atol=1e-11
+    )
+    
+    t_vals = sol.t
+    x1_true = sol.y[0, :]  # 실제 x1 값
+    
+    # 모델 예측
+    model.eval()
+    n_M = chaotic_system.memory_range_NM
+    
+    # 메모리 항목들을 포함한 입력 데이터 준비
+    z_traj = sol.y[:3, :].T  # x1, x2, x3만 추출
+    
+    x1_pred = []
+    with torch.no_grad():
+        for i in range(n_M + 1, len(z_traj)):
+            # Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
+            Z_input = z_traj[i-n_M-1:i].reshape(-1)  # [D]
+            Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)  # [1, D]
+            
+            # 예측
+            z_pred = model(Z_tensor)
+            x1_pred.append(z_pred[0, 0].item())  # x1 예측값
+    
+    # 시각화
+    t_pred = t_vals[n_M + 1:]
+    mask = (t_pred >= t_start_plot)
+    t_plot = t_pred[mask]
+    x1_true_plot = x1_true[n_M + 1:][mask]
+    x1_pred_plot = np.array(x1_pred)[mask]
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(t_plot, x1_true_plot, 'b-', label='True $x_1(t)$', linewidth=2)
+    plt.plot(t_plot, x1_pred_plot, 'r--', label='Pred $x_1(t)$', linewidth=2)
+    plt.xlabel('time t')
+    plt.ylabel('$x_1(t)$')
+    plt.title(f'dAMZ prediction vs real simulation [{t_start_plot}, {t_end}]')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    
+    # MSE 계산
+    mse = np.mean((x1_true_plot - x1_pred_plot) ** 2)
+    print(f'예측 MSE: {mse:.6f}')
+
+
 if __name__ == "__main__":
+    # 설정
+    dt = 0.02
+    memory_length_TM = 1.2
+    hidden_dim = 30
+    epochs = 2000
+    J0 = 50
+
     # ChaoticSystem 인스턴스 생성
-    chaotic_system = ChaoticSystem(eps=0.01)
+    chaotic_system = ChaoticSystem(
+        dt=dt,
+        N_T=100,
+        memory_length_TM=memory_length_TM,
+        eps=0.01,
+        selection_mode='random'
+    )
 
-    # trajectory 생성
-    trajectories = chaotic_system.generate_trajectories()
+    # Trajectory 생성
+    trajectories = chaotic_system.generate_trajectories(K=100, delta=dt)
     print(f"생성된 trajectory 수: {len(trajectories)}")
-    print(f"각 trajectory shape: {trajectories[0].shape}")  # (101, 3)
-    # 시스템 정보 출력
-    print("시스템 정보:")
-    print(chaotic_system.get_system_info())
+    print(f"각 trajectory shape: {trajectories[0].shape}")
 
-    X, Y = chaotic_system.create_training_dataset(trajectories, J0=50)
+    # 학습 데이터 생성
+    Z, z = chaotic_system.create_training_dataset(trajectories, J0=J0)
 
-    # 그래프 시각화로 데이터 확인
-    chaotic = ChaoticSystem(dt=0.02, N_T=100, memory_length_TM=1.2)
-    simulate_and_plot_x1(chaotic)
+    # 모델 생성 - 새로운 dAMZ 구조에 맞게 수정
+    d = 3  # 축소된 변수 차원 (x1, x2, x3)
+    n_M = chaotic_system.memory_range_NM  # 메모리 항목 수
+    model = dAMZ(d=d, n_M=n_M, hidden_dim=hidden_dim)
+    
+    # 모델 구조 정보 출력
+    model_info = model.get_memory_structure_info()
+    print(f"\n[+] dAMZ 모델 구조:")
+    print(f"  - 축소된 변수 차원 (d): {model_info['d']}")
+    print(f"  - 메모리 항목 수 (n_M): {model_info['n_M']}")
+    print(f"  - 입력 차원 (D): {model_info['D']}")
+    print(f"  - 출력 차원: {model_info['output_dim']}")
+    print(f"  - 실제 입력 데이터 shape: {Z.shape}")
+    print(f"  - 실제 출력 데이터 shape: {z.shape}")
 
-    # ResNet 구조로 d-AMZ 학습
+    # 학습
+    print("\n[+] Training model...")
+    train_model(model, Z, z, epochs=epochs, lr=1e-3)
 
-    '''
-    results_dir = os.path.join(os.getcwd(), "simulated_data")
-    with open(f"{results_dir}/metadata.json", "w") as f:
-        metadata = json.load(f)
-
-    K = metadata['K']
-    J = metadata['J']
-    F = metadata['F']
-    h = metadata['h']
-    b = metadata['b']
-    c = metadata['c']
-    dt = metadata['dt']
-    si = metadata['si']
-    spinup_time = metadata['spinup_time']
-    forecast_time = metadata['forecast_time']
-    ic_interval = metadata['ic_interval']
-    num_ic = metadata['num_ic']
-    time_steps_per_ic = metadata['time_steps_per_ic']
-    num_batches = metadata['num_batches']
-    batch_size = metadata['batch_size']
-
-    memory_length_TM = 100
-    memory_range_NM = int(memory_length_TM / dt)
-
-    # 데이터 로드
-    data_list = []
-    for i in range(1, num_ic + 1):
-        X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_{i}.npy"))
-        data_list.append([X_data])
-    '''
+    # 시뮬레이션 vs 예측 시각화 (더 짧은 구간으로 테스트)
+    print("\n[+] Simulating and plotting prediction vs ground truth...")
+    simulate_and_plot_x1_prediction(model, chaotic_system, t_end=400, t_start_plot=200, delta=0.02)
 
