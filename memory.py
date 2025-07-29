@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import time
 import random
 import torch
@@ -57,9 +58,10 @@ class dAMZ(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        """가중치 초기화"""
+        """가중치 초기화 - 더 안정적인 초기화"""
         if isinstance(module, nn.Linear):
-            torch.nn.init.xavier_uniform_(module.weight, gain=0.1)
+            # Xavier 초기화 대신 더 작은 값으로 초기화
+            torch.nn.init.xavier_uniform_(module.weight, gain=0.01)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
 
@@ -301,7 +303,38 @@ def create_deterministic_training_dataset(all_trajectories, memory_range_NM):
     print(f"[Deterministic] Z.shape = {Z.shape}, z.shape = {z.shape}")
     return Z, z
 
-def train_model(model, Z, z, epochs=2000, lr=1e-3, batch_size=32):
+def normalize_data(Z, z):
+    """
+    데이터 정규화 함수
+    
+    Args:
+        Z: 입력 데이터 [N, D]
+        z: 타겟 데이터 [N, d]
+    
+    Returns:
+        Z_norm: 정규화된 입력 데이터
+        z_norm: 정규화된 타겟 데이터
+        Z_mean, Z_std: 입력 데이터의 평균과 표준편차
+        z_mean, z_std: 타겟 데이터의 평균과 표준편차
+    """
+    # 입력 데이터 정규화
+    Z_mean = np.mean(Z, axis=0)
+    Z_std = np.std(Z, axis=0)
+    Z_std = np.where(Z_std == 0, 1.0, Z_std)  # 표준편차가 0인 경우 1로 설정
+    Z_norm = (Z - Z_mean) / Z_std
+    
+    # 타겟 데이터 정규화
+    z_mean = np.mean(z, axis=0)
+    z_std = np.std(z, axis=0)
+    z_std = np.where(z_std == 0, 1.0, z_std)  # 표준편차가 0인 경우 1로 설정
+    z_norm = (z - z_mean) / z_std
+    
+    print(f"입력 데이터 통계: mean={Z_mean.mean():.4f}, std={Z_std.mean():.4f}")
+    print(f"타겟 데이터 통계: mean={z_mean.mean():.4f}, std={z_std.mean():.4f}")
+    
+    return Z_norm, z_norm, Z_mean, Z_std, z_mean, z_std
+
+def train_model(model, Z, z, epochs=2000, lr=1e-3, batch_size=32, normalize=True, clip_grad_norm=1.0):
     """
     dAMZ 모델 학습 함수 (배치 처리 포함)
 
@@ -312,10 +345,17 @@ def train_model(model, Z, z, epochs=2000, lr=1e-3, batch_size=32):
         epochs: 학습 에포크 수
         lr: 학습률
         batch_size: 배치 크기
+        normalize: 데이터 정규화 여부
+        clip_grad_norm: 그래디언트 클리핑 값
     """
-    # 데이터를 텐서로 변환
-    Z_tensor = torch.FloatTensor(Z)
-    z_tensor = torch.FloatTensor(z)
+    # 데이터 정규화
+    if normalize:
+        Z_norm, z_norm, Z_mean, Z_std, z_mean, z_std = normalize_data(Z, z)
+        Z_tensor = torch.FloatTensor(Z_norm)
+        z_tensor = torch.FloatTensor(z_norm)
+    else:
+        Z_tensor = torch.FloatTensor(Z)
+        z_tensor = torch.FloatTensor(z)
 
     # 데이터셋 생성
     dataset = torch.utils.data.TensorDataset(Z_tensor, z_tensor)
@@ -323,11 +363,17 @@ def train_model(model, Z, z, epochs=2000, lr=1e-3, batch_size=32):
 
     # 손실 함수와 옵티마이저 정의
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)  # L2 정규화 추가
+    
+    # 학습률 스케줄러 추가
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50, verbose=True)
 
     # 학습
     model.train()
     losses = []
+    best_loss = float('inf')
+    patience_counter = 0
+    max_patience = 100
 
     for epoch in range(epochs):
         epoch_loss = 0.0
@@ -340,8 +386,27 @@ def train_model(model, Z, z, epochs=2000, lr=1e-3, batch_size=32):
             outputs = model(batch_Z)
             loss = criterion(outputs, batch_z)
 
+            # NaN 체크
+            if torch.isnan(loss):
+                print(f"경고: Epoch {epoch+1}에서 NaN 손실이 발생했습니다!")
+                print(f"입력 데이터 범위: [{batch_Z.min():.4f}, {batch_Z.max():.4f}]")
+                print(f"타겟 데이터 범위: [{batch_z.min():.4f}, {batch_z.max():.4f}]")
+                print(f"출력 데이터 범위: [{outputs.min():.4f}, {outputs.max():.4f}]")
+                return losses
+
             # 역전파
             loss.backward()
+            
+            # 그래디언트 클리핑
+            if clip_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+            
+            # 그래디언트 NaN 체크
+            for name, param in model.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"경고: {name}에서 NaN 그래디언트가 발생했습니다!")
+                    return losses
+            
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -350,9 +415,23 @@ def train_model(model, Z, z, epochs=2000, lr=1e-3, batch_size=32):
         # 에포크 평균 손실 계산
         avg_loss = epoch_loss / num_batches
         losses.append(avg_loss)
+        
+        # 학습률 스케줄러 업데이트
+        scheduler.step(avg_loss)
+        
+        # Early stopping
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= max_patience:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
 
-        if (epoch + 1) % 500 == 0:
-            print(f'Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.6f}')
+        if (epoch + 1) % 100 == 0:
+            print(f'Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.6f}, LR: {optimizer.param_groups[0]["lr"]:.2e}')
 
     print(f'Training completed. Final loss: {losses[-1]:.6f}')
     return losses
@@ -454,15 +533,257 @@ def simulate_and_plot_x1_prediction(model, chaotic_system, t_end=400, t_start_pl
         print(f"초기 조건 {initial_condition}에서 시스템이 불안정할 수 있습니다.")
 
 
+def lorenz96_system_equations(t, state, F, h, b, c, K, J):
+    """
+    Lorenz 96 two-time-scale 시스템의 미분 방정식
+    
+    Args:
+        t: 시간
+        state: 상태 벡터 [X, Y] (X는 K차원, Y는 K*J차원)
+        F, h, b, c: 시스템 파라미터
+        K: X 변수의 수
+        J: 각 X에 대응하는 Y 변수의 수
+    
+    Returns:
+        derivatives: 미분값 [dX/dt, dY/dt]
+    """
+    X = state[:K]
+    Y = state[K:]
+    
+    # X의 미분 계산
+    dX = np.zeros(K)
+    for k in range(K):
+        dX[k] = (X[(k+1) % K] - X[(k-2) % K]) * X[(k-1) % K] - X[k] + F - (h * c / b) * np.sum(Y[k*J:(k+1)*J])
+    
+    # Y의 미분 계산
+    dY = np.zeros(K * J)
+    for k in range(K):
+        for j in range(J):
+            idx = k * J + j
+            dY[idx] = -b * c * Y[(idx + 1) % (K * J)] * (Y[(idx + 2) % (K * J)] - Y[(idx - 1) % (K * J)]) - c * Y[idx] + (h * c / b) * X[k]
+    
+    return np.concatenate([dX, dY])
+
+
+def simulate_and_plot_lorenz96_x1_prediction(model, metadata, t_end=10, t_start_plot=2, delta=0.005):
+    """
+    Lorenz 96 시스템의 첫 번째 변수(X1)에 대한 모델 예측과 실제 시뮬레이션을 비교하여 시각화하는 함수
+
+    Args:
+        model: 학습된 dAMZ 모델
+        metadata: Lorenz 96 시스템의 메타데이터
+        t_end: 적분 끝 시간
+        t_start_plot: 시각화 시작 시간
+        delta: 시간 간격
+    """
+    # 시스템 파라미터 추출
+    K = metadata['K']
+    J = metadata['J']
+    F = metadata['F']
+    h = metadata['h']
+    b = metadata['b']
+    c = metadata['c']
+    dt = metadata['dt']
+    
+    # 초기 조건 설정 (Lorenz 96 시스템에 맞는 초기 조건)
+    k = np.arange(K)
+    j = np.arange(J * K)
+    
+    # 초기 조건 함수 (multiscale_lorenz.py에서 가져옴)
+    def s(k, K):
+        return 2 * np.pi * k / K
+    
+    X_init = s(k, K) * (s(k, K) - 1) * (s(k, K) + 1)
+    Y_init = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
+    
+    initial_condition = np.concatenate([X_init, Y_init])
+    print(f"초기 조건 X: {X_init}")
+    print(f"초기 조건 Y: {Y_init[:J]} (첫 번째 그룹만 표시)")
+
+    # 실제 시뮬레이션
+    t_eval = np.arange(0, t_end + delta, delta)
+    t_span = (0, t_end)
+
+    try:
+        # Lorenz 96 시스템 적분
+        sol = solve_ivp(
+            fun=lambda t, y: lorenz96_system_equations(t, y, F, h, b, c, K, J),
+            t_span=t_span,
+            y0=initial_condition,
+            t_eval=t_eval,
+            method='RK45',
+            rtol=1e-9,
+            atol=1e-11
+        )
+
+        t_vals = sol.t
+        X_true = sol.y[:K, :].T  # X 변수들만 추출
+        x1_true = X_true[:, 0]  # 첫 번째 변수
+
+        print(f"시뮬레이션 완료: {len(t_vals)} 시간 스텝")
+        print(f"X1 범위: [{x1_true.min():.3f}, {x1_true.max():.3f}]")
+
+        # 시스템 발산 감지
+        if np.any(np.abs(x1_true) > 1000) or len(t_vals) < t_end / delta * 0.5:
+            print("경고: 시스템이 발산했습니다. 이 초기 조건은 건너뜁니다.")
+            return
+
+        # 모델 예측
+        model.eval()
+        n_M = int(0.05 / dt)  # 메모리 길이
+
+        # 메모리 항목들을 포함한 입력 데이터 준비
+        x1_pred = []
+        with torch.no_grad():
+            for i in range(n_M + 1, len(X_true)):
+                # Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
+                Z_input = X_true[i-n_M-1:i].reshape(-1)  # [D]
+                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)  # [1, D]
+
+                # 예측
+                z_pred = model(Z_tensor)
+                x1_pred.append(z_pred[0, 0].item())  # X1 예측값
+
+        print(f"예측 완료: {len(x1_pred)} 개의 예측값")
+
+        # 시각화
+        t_pred = t_vals[n_M + 1:]
+        mask = (t_pred >= t_start_plot)
+        t_plot = t_pred[mask]
+        x1_true_plot = x1_true[n_M + 1:][mask]
+        x1_pred_plot = np.array(x1_pred)[mask]
+
+        print(f"필터링 후 데이터: {len(t_plot)} 개의 시간 포인트")
+        print(f"t_plot 범위: [{t_plot.min():.3f}, {t_plot.max():.3f}]")
+
+        if len(t_plot) == 0:
+            print("경고: 필터링 후 데이터가 없습니다!")
+            print(f"t_start_plot={t_start_plot}, t_pred 범위=[{t_pred.min():.3f}, {t_pred.max():.3f}]")
+            return
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(t_plot, x1_true_plot, 'b-', label='True $X_1(t)$', linewidth=2)
+        plt.plot(t_plot, x1_pred_plot, 'r--', label='Pred $X_1(t)$', linewidth=2)
+        plt.xlabel('time t')
+        plt.ylabel('$X_1(t)$')
+        plt.title(f'Lorenz 96 dAMZ prediction vs real simulation [{t_start_plot}, {t_end}]')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        # MSE 계산
+        mse = np.mean((x1_true_plot - x1_pred_plot) ** 2)
+        print(f'예측 MSE: {mse:.6f}')
+
+    except Exception as e:
+        print(f"시뮬레이션 중 오류 발생: {e}")
+        print(f"초기 조건에서 시스템이 불안정할 수 있습니다.")
+
+
+def simulate_and_plot_lorenz96_all_variables(model, metadata, t_end=10, t_start_plot=2, delta=0.005):
+    """
+    Lorenz 96 시스템의 모든 X 변수에 대한 모델 예측과 실제 시뮬레이션을 비교하여 시각화하는 함수
+
+    Args:
+        model: 학습된 dAMZ 모델
+        metadata: Lorenz 96 시스템의 메타데이터
+        t_end: 적분 끝 시간
+        t_start_plot: 시각화 시작 시간
+        delta: 시간 간격
+    """
+    # 시스템 파라미터 추출
+    K = metadata['K']
+    J = metadata['J']
+    F = metadata['F']
+    h = metadata['h']
+    b = metadata['b']
+    c = metadata['c']
+    dt = metadata['dt']
+    
+    # 초기 조건 설정
+    k = np.arange(K)
+    j = np.arange(J * K)
+    
+    def s(k, K):
+        return 2 * np.pi * k / K
+    
+    X_init = s(k, K) * (s(k, K) - 1) * (s(k, K) + 1)
+    Y_init = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
+    
+    initial_condition = np.concatenate([X_init, Y_init])
+
+    # 실제 시뮬레이션
+    t_eval = np.arange(0, t_end + delta, delta)
+    t_span = (0, t_end)
+
+    try:
+        sol = solve_ivp(
+            fun=lambda t, y: lorenz96_system_equations(t, y, F, h, b, c, K, J),
+            t_span=t_span,
+            y0=initial_condition,
+            t_eval=t_eval,
+            method='RK45',
+            rtol=1e-9,
+            atol=1e-11
+        )
+
+        t_vals = sol.t
+        X_true = sol.y[:K, :].T
+
+        # 모델 예측
+        model.eval()
+        n_M = int(0.05 / dt)
+
+        X_pred = []
+        with torch.no_grad():
+            for i in range(n_M + 1, len(X_true)):
+                Z_input = X_true[i-n_M-1:i].reshape(-1)
+                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)
+                z_pred = model(Z_tensor)
+                X_pred.append(z_pred[0].numpy())
+
+        X_pred = np.array(X_pred)
+        t_pred = t_vals[n_M + 1:]
+        mask = (t_pred >= t_start_plot)
+        t_plot = t_pred[mask]
+        X_true_plot = X_true[n_M + 1:][mask]
+        X_pred_plot = X_pred[mask]
+
+        # 모든 변수 시각화
+        fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+        axes = axes.flatten()
+
+        for i in range(K):
+            ax = axes[i]
+            ax.plot(t_plot, X_true_plot[:, i], 'b-', label='True', linewidth=2)
+            ax.plot(t_plot, X_pred_plot[:, i], 'r--', label='Pred', linewidth=2)
+            ax.set_xlabel('time t')
+            ax.set_ylabel(f'$X_{i+1}(t)$')
+            ax.set_title(f'Variable {i+1}')
+            ax.legend()
+            ax.grid(True)
+
+        plt.tight_layout()
+        plt.show()
+
+        # 전체 MSE 계산
+        mse_total = np.mean((X_true_plot - X_pred_plot) ** 2)
+        print(f'전체 예측 MSE: {mse_total:.6f}')
+
+    except Exception as e:
+        print(f"시뮬레이션 중 오류 발생: {e}")
+
+
 if __name__ == "__main__":
     # 설정
     test_chaotic_system, test_lorenz_system = False, True
+    hidden_dim = 30
+    epochs = 2000
+    J0 = 50
     if test_chaotic_system:
         dt = 0.02
         memory_length_TM = 1.2
-        hidden_dim = 30
-        epochs = 2000
-        J0 = 50
 
         # ChaoticSystem 인스턴스 생성
         chaotic_system = ChaoticSystem(
@@ -481,6 +802,12 @@ if __name__ == "__main__":
 
         # 학습 데이터 생성
         Z, z = create_training_dataset(trajectories, n_M, selection_mode='random', J0=J0)
+                
+        # 학습
+        print("\n[+] Training model...")
+        train_model(model, Z, z, epochs=epochs, lr=1e-3, batch_size=32)
+        
+        print("\n[+] Lorenz 96 시스템 학습 완료!")
 
         # 모델 생성 - 새로운 dAMZ 구조에 맞게 수정
         d = 3  # 축소된 변수 차원 (x1, x2, x3)
@@ -510,4 +837,109 @@ if __name__ == "__main__":
     
     if test_lorenz_system:
         # 기존에 생성한 Lorenz 96 system dataset 이용
-        pass
+        print("\n[+] Loading Lorenz 96 system dataset...")
+        results_dir = os.path.join(os.getcwd(), "simulated_data")
+        with open(os.path.join(results_dir, "metadata.json"), "r") as f:
+            metadata = json.load(f)
+
+        K = metadata['K']
+        J = metadata['J']
+        F = metadata['F']
+        h = metadata['h']
+        b = metadata['b']
+        c = metadata['c']
+        dt = metadata['dt']
+        si = metadata['si']
+        spinup_time = metadata['spinup_time']
+        forecast_time = metadata['forecast_time']
+        num_ic = metadata['num_ic']
+
+        # 메모리 길이를 더 작게 설정하여 차원 문제 해결
+        memory_length_TM = 0.05  # 0.1에서 0.05로 줄임
+        n_M = int(memory_length_TM / dt)
+        
+        # 데이터 로드 및 전처리
+        trajectories = []
+        for i in range(1, min(num_ic + 1, 51)):  # 처음 50개만 사용하여 메모리 절약
+            try:
+                X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_{i}.npy"))
+                # X_data shape: (1, time_steps, 8) -> (time_steps, 8)로 변환
+                trajectory = X_data[0]  # 첫 번째 배치만 사용
+                
+                # 데이터 품질 체크
+                if np.any(np.isnan(trajectory)) or np.any(np.isinf(trajectory)):
+                    print(f"경고: 배치 {i}에서 NaN 또는 Inf 값이 발견되어 건너뜁니다.")
+                    continue
+                    
+                # 극단적인 값 필터링
+                if np.any(np.abs(trajectory) > 1000):
+                    print(f"경고: 배치 {i}에서 극단적인 값이 발견되어 건너뜁니다.")
+                    continue
+                    
+                trajectories.append(trajectory)
+            except Exception as e:
+                print(f"배치 {i} 로드 중 오류: {e}")
+                continue
+
+        print(f"로드된 trajectory 수: {len(trajectories)}")            
+        print(f"첫 번째 trajectory shape: {trajectories[0].shape}")
+        
+        Z, z = create_training_dataset(trajectories, n_M, selection_mode='random', J0=J0)
+        
+        # 데이터 품질 체크
+        print(f"Z 데이터 통계: min={Z.min():.4f}, max={Z.max():.4f}, mean={Z.mean():.4f}, std={Z.std():.4f}")
+        print(f"z 데이터 통계: min={z.min():.4f}, max={z.max():.4f}, mean={z.mean():.4f}, std={z.std():.4f}")
+        
+        if np.any(np.isnan(Z)) or np.any(np.isnan(z)):
+            print("오류: 학습 데이터에 NaN 값이 포함되어 있습니다!")
+            sys.exit(1)
+
+        # Lorenz 96 시스템에 맞는 모델 생성
+        d = 8  # Lorenz 96 시스템의 변수 수
+        print(f"모델 생성 시작: d={d}, n_M={n_M}, hidden_dim={hidden_dim}")
+        model = dAMZ(d=d, n_M=n_M, hidden_dim=hidden_dim)
+        print("모델 생성 완료")
+        
+        # 모델 구조 정보 출력
+        model_info = model.get_memory_structure_info()
+        print(f"\n[+] dAMZ 모델 구조 (Lorenz 96):")
+        print(f"  - 축소된 변수 차원 (d): {model_info['d']}")
+        print(f"  - 메모리 항목 수 (n_M): {model_info['n_M']}")
+        print(f"  - 입력 차원 (D): {model_info['D']}")
+        print(f"  - 출력 차원: {model_info['output_dim']}")
+        print(f"  - 실제 입력 데이터 shape: {Z.shape}")
+        print(f"  - 실제 출력 데이터 shape: {z.shape}")
+
+        print("\n[+] Training model...")
+        # 더 안정적인 학습 파라미터 사용
+        losses = train_model(
+            model, Z, z, 
+            epochs=epochs, 
+            lr=5e-4,  # 더 작은 학습률
+            batch_size=256,  # 더 작은 배치 크기
+            normalize=True,  # 데이터 정규화 활성화
+            clip_grad_norm=0.5  # 그래디언트 클리핑
+        )
+        
+        print("\n[+] Lorenz 96 시스템 학습 완료!")
+        
+        # 학습 손실 그래프 시각화
+        plt.figure(figsize=(10, 6))
+        plt.plot(losses)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training Loss')
+        plt.yscale('log')
+        plt.grid(True)
+        plt.show()
+        
+        # 예측 시각화
+        print("\n[+] Simulating and plotting prediction vs ground truth...")
+        
+        # 첫 번째 변수만 시각화
+        print("\n--- 첫 번째 변수(X1) 예측 ---")
+        simulate_and_plot_lorenz96_x1_prediction(model, metadata, t_end=5, t_start_plot=1, delta=0.005)
+        
+        # 모든 변수 시각화
+        print("\n--- 모든 변수 예측 ---")
+        simulate_and_plot_lorenz96_all_variables(model, metadata, t_end=5, t_start_plot=1, delta=0.005)
