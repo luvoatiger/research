@@ -25,7 +25,7 @@ class dAMZ(nn.Module):
     Eq. (17): z_{n+1} = z_n + N(z_n, z_{n-1}, ..., z_{n-nM}; Θ), n ≥ n_M
     """
 
-    def __init__(self, d=3, n_M=60, hidden_dim=30):
+    def __init__(self, d=3, n_M=60, hidden_dim=30, dropout_rate=0.1):
         """
         dAMZ 신경망 초기화
 
@@ -33,24 +33,28 @@ class dAMZ(nn.Module):
             d (int): 축소된 변수의 차원 (기본값: 3, x1, x2, x3)
             n_M (int): 메모리 항목 수 (memory_length_TM / dt)
             hidden_dim (int): 은닉층 차원
+            dropout_rate (float): dropout 비율 (기본값: 0.1)
         """
         super(dAMZ, self).__init__()
 
         self.d = d  # 축소된 변수 차원
         self.n_M = n_M  # 메모리 항목 수
         self.D = d * (n_M + 1)  # Eq. (13): D = d × (n_M + 1)
+        self.dropout_rate = dropout_rate
 
         # Î 행렬 정의: Î = [I_d, 0, ..., 0] (d × D)
         # I_d는 (d × d) 단위행렬, n_M개의 (d × d) 영행렬과 연결
         self.I_hat = torch.zeros(d, self.D)
         self.I_hat[:d, :d] = torch.eye(d)  # 첫 번째 d×d 블록만 단위행렬
 
-        # 신경망 N(⋅; Θ) 정의: R^D → R^d
+        # 신경망 N(⋅; Θ) 정의: R^D → R^d (Monte Carlo Dropout 포함)
         self.neural_network = nn.Sequential(
             nn.Linear(self.D, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout_rate),  # 첫 번째 dropout
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout_rate),  # 두 번째 dropout
             nn.Linear(hidden_dim, d)
         )
 
@@ -65,13 +69,14 @@ class dAMZ(nn.Module):
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
 
-    def forward(self, Z_in):
+    def forward(self, Z_in, enable_dropout=True):
         """
         Forward pass - Eq. (16)과 Eq. (17) 구현
 
         Args:
             Z_in (torch.Tensor): 입력 텐서 [batch_size, D]
                                 Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
+            enable_dropout (bool): dropout 활성화 여부 (기본값: True)
 
         Returns:
             torch.Tensor: 출력 [batch_size, d] - z_{n+1}
@@ -88,6 +93,13 @@ class dAMZ(nn.Module):
         z_n = torch.bmm(I_hat_batch, Z_in_matrix).squeeze(2)  # [batch_size, d]
 
         # 신경망 N(Z_in) 계산
+        if enable_dropout:
+            # 학습 모드에서 dropout 활성화
+            self.neural_network.train()
+        else:
+            # 평가 모드에서 dropout 비활성화
+            self.neural_network.eval()
+            
         N_output = self.neural_network(Z_in)  # [batch_size, d]
 
         # Eq. (16): z^out = [Î + N] (Z^in) = z_n + N(Z_in)
@@ -96,6 +108,34 @@ class dAMZ(nn.Module):
 
         return z_out
 
+    def predict_with_uncertainty(self, Z_in, num_samples=100):
+        """
+        Monte Carlo Dropout을 사용한 불확실성 추정
+        
+        Args:
+            Z_in (torch.Tensor): 입력 텐서 [batch_size, D]
+            num_samples (int): Monte Carlo 샘플 수
+            
+        Returns:
+            tuple: (mean_prediction, std_prediction)
+                - mean_prediction: 평균 예측 [batch_size, d]
+                - std_prediction: 예측 표준편차 [batch_size, d]
+        """
+        self.train()  # dropout을 활성화하기 위해 학습 모드로 설정
+        
+        predictions = []
+        with torch.no_grad():
+            for _ in range(num_samples):
+                pred = self.forward(Z_in, enable_dropout=True)
+                predictions.append(pred)
+        
+        # 예측들을 스택하여 통계 계산
+        predictions = torch.stack(predictions, dim=0)  # [num_samples, batch_size, d]
+        mean_prediction = torch.mean(predictions, dim=0)  # [batch_size, d]
+        std_prediction = torch.std(predictions, dim=0)  # [batch_size, d]
+        
+        return mean_prediction, std_prediction
+
     def get_memory_structure_info(self):
         """메모리 구조 정보 반환"""
         return {
@@ -103,7 +143,8 @@ class dAMZ(nn.Module):
             'n_M': self.n_M,
             'D': self.D,
             'input_dim': self.D,
-            'output_dim': self.d
+            'output_dim': self.d,
+            'dropout_rate': self.dropout_rate
         }
 
 
@@ -823,6 +864,304 @@ def evaluate_extrapolation_performance(model, metadata, num_trials=5, t_end=10, 
         return [], None
 
 
+def simulate_and_plot_lorenz96_with_uncertainty(model, metadata, t_end=10, t_start_plot=2, delta=0.005, num_mc_samples=100):
+    """
+    Lorenz 96 시스템의 첫 번째 변수(X1)에 대한 불확실성을 포함한 모델 예측과 실제 시뮬레이션을 비교하여 시각화하는 함수
+
+    Args:
+        model: 학습된 dAMZ 모델 (Monte Carlo Dropout 포함)
+        metadata: Lorenz 96 시스템의 메타데이터
+        t_end: 적분 끝 시간
+        t_start_plot: 시각화 시작 시간
+        delta: 시간 간격
+        num_mc_samples: Monte Carlo 샘플 수
+    """
+    # 시스템 파라미터 추출
+    K = metadata['K']
+    J = metadata['J']
+    F = metadata['F']
+    h = metadata['h']
+    b = metadata['b']
+    c = metadata['c']
+    dt = metadata['dt']
+    
+    # 초기 조건 설정 (Lorenz 96 시스템에 맞는 초기 조건)
+    k = np.arange(K)
+    j = np.arange(J * K)
+    
+    # 초기 조건 함수 (multiscale_lorenz.py에서 가져옴)
+    def s(k, K):
+        return 2 * np.pi * k / K
+    
+    X_init = s(k, K) * (s(k, K) - 1) * (s(k, K) + 1)
+    Y_init = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
+    
+    initial_condition = np.concatenate([X_init, Y_init])
+    print(f"초기 조건 X: {X_init}")
+    print(f"초기 조건 Y: {Y_init[:J]} (첫 번째 그룹만 표시)")
+
+    # 실제 시뮬레이션
+    t_eval = np.arange(0, t_end + delta, delta)
+    t_span = (0, t_end)
+
+    try:
+        # Lorenz 96 시스템 적분
+        sol = solve_ivp(
+            fun=lambda t, y: lorenz96_system_equations(t, y, F, h, b, c, K, J),
+            t_span=t_span,
+            y0=initial_condition,
+            t_eval=t_eval,
+            method='RK45',
+            rtol=1e-9,
+            atol=1e-11
+        )
+
+        t_vals = sol.t
+        X_true = sol.y[:K, :].T  # X 변수들만 추출
+        x1_true = X_true[:, 0]  # 첫 번째 변수
+
+        print(f"시뮬레이션 완료: {len(t_vals)} 시간 스텝")
+        print(f"X1 범위: [{x1_true.min():.3f}, {x1_true.max():.3f}]")
+
+        # 시스템 발산 감지
+        if np.any(np.abs(x1_true) > 1000) or len(t_vals) < t_end / delta * 0.5:
+            print("경고: 시스템이 발산했습니다. 이 초기 조건은 건너뜁니다.")
+            return
+
+        # 모델 예측 (불확실성 포함)
+        n_M = int(0.05 / dt)  # 메모리 길이
+
+        # 메모리 항목들을 포함한 입력 데이터 준비
+        x1_pred_mean = []
+        x1_pred_std = []
+        
+        with torch.no_grad():
+            for i in range(n_M + 1, len(X_true)):
+                # Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
+                Z_input = X_true[i-n_M-1:i].reshape(-1)  # [D]
+                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)  # [1, D]
+
+                # Monte Carlo Dropout을 사용한 불확실성 추정
+                mean_pred, std_pred = model.predict_with_uncertainty(Z_tensor, num_samples=num_mc_samples)
+                x1_pred_mean.append(mean_pred[0, 0].item())  # X1 평균 예측값
+                x1_pred_std.append(std_pred[0, 0].item())    # X1 표준편차
+
+        print(f"예측 완료: {len(x1_pred_mean)} 개의 예측값 (Monte Carlo 샘플 수: {num_mc_samples})")
+
+        # 시각화
+        t_pred = t_vals[n_M + 1:]
+        mask = (t_pred >= t_start_plot)
+        t_plot = t_pred[mask]
+        x1_true_plot = x1_true[n_M + 1:][mask]
+        x1_pred_mean_plot = np.array(x1_pred_mean)[mask]
+        x1_pred_std_plot = np.array(x1_pred_std)[mask]
+
+        print(f"필터링 후 데이터: {len(t_plot)} 개의 시간 포인트")
+        print(f"t_plot 범위: [{t_plot.min():.3f}, {t_plot.max():.3f}]")
+
+        if len(t_plot) == 0:
+            print("경고: 필터링 후 데이터가 없습니다!")
+            print(f"t_start_plot={t_start_plot}, t_pred 범위=[{t_pred.min():.3f}, {t_pred.max():.3f}]")
+            return
+
+        # 불확실성을 포함한 시각화
+        plt.figure(figsize=(12, 8))
+        
+        # 실제 값과 평균 예측
+        plt.plot(t_plot, x1_true_plot, 'b-', label='True $X_1(t)$', linewidth=2)
+        plt.plot(t_plot, x1_pred_mean_plot, 'r--', label='Pred $X_1(t)$ (mean)', linewidth=2)
+        
+        # 불확실성 구간 (95% 신뢰구간)
+        plt.fill_between(t_plot, 
+                        x1_pred_mean_plot - 2*x1_pred_std_plot, 
+                        x1_pred_mean_plot + 2*x1_pred_std_plot, 
+                        alpha=0.3, color='red', label='95% Confidence Interval')
+        
+        # 1 표준편차 구간
+        plt.fill_between(t_plot, 
+                        x1_pred_mean_plot - x1_pred_std_plot, 
+                        x1_pred_mean_plot + x1_pred_std_plot, 
+                        alpha=0.5, color='red', label='±1σ Interval')
+        
+        plt.xlabel('time t')
+        plt.ylabel('$X_1(t)$')
+        plt.title(f'Lorenz 96 dAMZ prediction with uncertainty [{t_start_plot}, {t_end}]')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        # MSE 및 RMSE 계산 (평균 예측 기준)
+        mse = np.mean((x1_true_plot - x1_pred_mean_plot) ** 2)
+        rmse = np.sqrt(mse)
+        print(f'예측 MSE: {mse:.6f}')
+        print(f'예측 RMSE: {rmse:.6f}')
+        
+        # 데이터 범위 대비 상대적 오차
+        data_range = x1_true_plot.max() - x1_true_plot.min()
+        relative_error = rmse / data_range * 100
+        print(f'상대적 오차: {relative_error:.2f}%')
+        
+        # 불확실성 통계
+        mean_uncertainty = np.mean(x1_pred_std_plot)
+        max_uncertainty = np.max(x1_pred_std_plot)
+        print(f'평균 불확실성 (표준편차): {mean_uncertainty:.6f}')
+        print(f'최대 불확실성 (표준편차): {max_uncertainty:.6f}')
+
+    except Exception as e:
+        print(f"시뮬레이션 중 오류 발생: {e}")
+        print(f"초기 조건에서 시스템이 불안정할 수 있습니다.")
+
+
+def evaluate_extrapolation_performance_with_uncertainty(model, metadata, num_trials=5, t_end=10, t_start_plot=2, delta=0.005, num_mc_samples=100):
+    """
+    랜덤 초기 조건에 대해 불확실성을 포함한 extrapolation 성능을 평가하는 함수
+    논문의 성능 측정 방법: np.linalg.norm(X_ext-Xpred_ext) / np.linalg.norm(X_ext)
+    
+    Args:
+        model: 학습된 dAMZ 모델 (Monte Carlo Dropout 포함)
+        metadata: Lorenz 96 시스템의 메타데이터
+        num_trials: 평가할 랜덤 초기 조건의 수
+        t_end: 적분 끝 시간
+        t_start_plot: 시각화 시작 시간
+        delta: 시간 간격
+        num_mc_samples: Monte Carlo 샘플 수
+    
+    Returns:
+        performance_scores: 각 시도별 성능 점수 리스트
+        mean_performance: 평균 성능 점수
+        uncertainty_scores: 각 시도별 평균 불확실성 점수 리스트
+    """
+    # 시스템 파라미터 추출
+    K = metadata['K']
+    J = metadata['J']
+    F = metadata['F']
+    h = metadata['h']
+    b = metadata['b']
+    c = metadata['c']
+    dt = metadata['dt']
+    
+    performance_scores = []
+    uncertainty_scores = []
+    
+    print(f"\n=== Extrapolation 성능 평가 (불확실성 포함, 랜덤 초기 조건 {num_trials}개) ===")
+    
+    for trial in range(num_trials):
+        print(f"\n--- 시도 {trial + 1}/{num_trials} ---")
+        
+        # 랜덤 초기 조건 생성
+        np.random.seed(42 + trial)  # 재현성을 위한 시드 설정
+        
+        # X 초기 조건: 논문과 유사한 범위로 설정
+        X_init = np.random.uniform(-5, 5, K)
+        
+        # Y 초기 조건: 작은 값으로 설정
+        Y_init = np.random.uniform(-0.1, 0.1, K * J)
+        
+        initial_condition = np.concatenate([X_init, Y_init])
+        print(f"초기 조건 X: {X_init}")
+        print(f"초기 조건 Y 범위: [{Y_init.min():.3f}, {Y_init.max():.3f}]")
+
+        # 실제 시뮬레이션
+        t_eval = np.arange(0, t_end + delta, delta)
+        t_span = (0, t_end)
+
+        try:
+            # Lorenz 96 시스템 적분
+            sol = solve_ivp(
+                fun=lambda t, y: lorenz96_system_equations(t, y, F, h, b, c, K, J),
+                t_span=t_span,
+                y0=initial_condition,
+                t_eval=t_eval,
+                method='RK45',
+                rtol=1e-9,
+                atol=1e-11
+            )
+
+            t_vals = sol.t
+            X_true = sol.y[:K, :].T  # X 변수들만 추출
+
+            # 시스템 발산 감지
+            if np.any(np.abs(X_true) > 1000) or len(t_vals) < t_end / delta * 0.5:
+                print("경고: 시스템이 발산했습니다. 이 시도는 건너뜁니다.")
+                continue
+
+            # 모델 예측 (불확실성 포함)
+            n_M = int(0.05 / dt)  # 메모리 길이
+
+            X_pred_mean = []
+            X_pred_std = []
+            
+            with torch.no_grad():
+                for i in range(n_M + 1, len(X_true)):
+                    # Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
+                    Z_input = X_true[i-n_M-1:i].reshape(-1)  # [D]
+                    Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)  # [1, D]
+
+                    # Monte Carlo Dropout을 사용한 불확실성 추정
+                    mean_pred, std_pred = model.predict_with_uncertainty(Z_tensor, num_samples=num_mc_samples)
+                    X_pred_mean.append(mean_pred[0].numpy())
+                    X_pred_std.append(std_pred[0].numpy())
+
+            X_pred_mean = np.array(X_pred_mean)
+            X_pred_std = np.array(X_pred_std)
+            t_pred = t_vals[n_M + 1:]
+            
+            # extrapolation 구간 설정 (t_start_plot 이후)
+            mask = (t_pred >= t_start_plot)
+            X_ext = X_true[n_M + 1:][mask]  # 실제 extrapolation 데이터
+            Xpred_ext = X_pred_mean[mask]  # 예측 extrapolation 데이터 (평균)
+            Xpred_std_ext = X_pred_std[mask]  # 예측 불확실성
+
+            if len(X_ext) == 0:
+                print("경고: extrapolation 데이터가 없습니다!")
+                continue
+
+            # 논문의 성능 측정 방법 적용
+            # np.linalg.norm(X_ext-Xpred_ext) / np.linalg.norm(X_ext)
+            numerator = np.linalg.norm(X_ext - Xpred_ext)
+            denominator = np.linalg.norm(X_ext)
+            
+            if denominator == 0:
+                print("경고: 분모가 0입니다!")
+                continue
+                
+            performance_score = numerator / denominator
+            performance_scores.append(performance_score)
+            
+            # 평균 불확실성 계산
+            mean_uncertainty = np.mean(Xpred_std_ext)
+            uncertainty_scores.append(mean_uncertainty)
+            
+            print(f"Extrapolation 성능 점수: {performance_score:.6f}")
+            print(f"  - 분자 (예측 오차 norm): {numerator:.6f}")
+            print(f"  - 분모 (실제 데이터 norm): {denominator:.6f}")
+            print(f"  - 평균 불확실성: {mean_uncertainty:.6f}")
+            print(f"  - 데이터 포인트 수: {len(X_ext)}")
+
+        except Exception as e:
+            print(f"시뮬레이션 중 오류 발생: {e}")
+            continue
+
+    # 평균 성능 계산
+    if len(performance_scores) > 0:
+        mean_performance = np.mean(performance_scores)
+        std_performance = np.std(performance_scores)
+        mean_uncertainty = np.mean(uncertainty_scores)
+        
+        print(f"\n=== 최종 결과 ===")
+        print(f"성공한 시도 수: {len(performance_scores)}/{num_trials}")
+        print(f"개별 성능 점수: {[f'{score:.6f}' for score in performance_scores]}")
+        print(f"평균 성능 점수: {mean_performance:.6f}")
+        print(f"성능 점수 표준편차: {std_performance:.6f}")
+        print(f"평균 불확실성: {mean_uncertainty:.6f}")
+        
+        return performance_scores, mean_performance, uncertainty_scores
+    else:
+        print("성공한 시도가 없습니다!")
+        return [], None, []
+
+
 def simulate_and_plot_lorenz96_all_variables(model, metadata, t_end=10, t_start_plot=2, delta=0.005):
     """
     Lorenz 96 시스템의 모든 X 변수에 대한 모델 예측과 실제 시뮬레이션을 비교하여 시각화하는 함수
@@ -1044,10 +1383,11 @@ if __name__ == "__main__":
             print("오류: 학습 데이터에 NaN 값이 포함되어 있습니다!")
             sys.exit(1)
 
-        # Lorenz 96 시스템에 맞는 모델 생성
+        # Lorenz 96 시스템에 맞는 모델 생성 (Monte Carlo Dropout 포함)
         d = 8  # Lorenz 96 시스템의 변수 수
-        print(f"모델 생성 시작: d={d}, n_M={n_M}, hidden_dim={hidden_dim}")
-        model = dAMZ(d=d, n_M=n_M, hidden_dim=hidden_dim)
+        dropout_rate = 0.1  # dropout 비율
+        print(f"모델 생성 시작: d={d}, n_M={n_M}, hidden_dim={hidden_dim}, dropout_rate={dropout_rate}")
+        model = dAMZ(d=d, n_M=n_M, hidden_dim=hidden_dim, dropout_rate=dropout_rate)
         print("모델 생성 완료")
         
         # 모델 구조 정보 출력
@@ -1090,6 +1430,10 @@ if __name__ == "__main__":
         print("\n--- 첫 번째 변수(X1) 예측 ---")
         simulate_and_plot_lorenz96_x1_prediction(model, metadata, t_end=5, t_start_plot=1, delta=0.005)
         
+        # 불확실성을 포함한 첫 번째 변수 예측
+        print("\n--- 첫 번째 변수(X1) 예측 (불확실성 포함) ---")
+        simulate_and_plot_lorenz96_with_uncertainty(model, metadata, t_end=5, t_start_plot=1, delta=0.005, num_mc_samples=100)
+        
         # 모든 변수 시각화
         print("\n--- 모든 변수 예측 ---")
         simulate_and_plot_lorenz96_all_variables(model, metadata, t_end=5, t_start_plot=1, delta=0.005)
@@ -1097,3 +1441,7 @@ if __name__ == "__main__":
         # Extrapolation 성능 평가
         print("\n[+] Extrapolation 성능 평가...")
         evaluate_extrapolation_performance(model, metadata, num_trials=5, t_end=5, t_start_plot=1, delta=0.005)
+
+        # 불확실성을 포함한 Extrapolation 성능 평가
+        print("\n[+] Extrapolation 성능 평가 (불확실성 포함)...")
+        evaluate_extrapolation_performance_with_uncertainty(model, metadata, num_trials=5, t_end=5, t_start_plot=1, delta=0.005, num_mc_samples=100)
