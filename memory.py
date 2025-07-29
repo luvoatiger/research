@@ -449,6 +449,7 @@ def simulate_and_plot_x1_prediction(model, chaotic_system, t_end=400, t_start_pl
     x1_true_plot = x1_true[n_M + 1:][mask]
     x1_pred_plot = np.array(x1_pred)[mask]
     
+    print(x1_true_plot.shape, x1_pred_plot.shape)
     plt.figure(figsize=(12, 6))
     plt.plot(t_plot, x1_true_plot, 'b-', label='True $x_1(t)$', linewidth=2)
     plt.plot(t_plot, x1_pred_plot, 'r--', label='Pred $x_1(t)$', linewidth=2)
