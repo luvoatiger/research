@@ -672,13 +672,155 @@ def simulate_and_plot_lorenz96_x1_prediction(model, metadata, t_end=10, t_start_
         plt.tight_layout()
         plt.show()
 
-        # MSE 계산
+        # MSE 및 RMSE 계산
         mse = np.mean((x1_true_plot - x1_pred_plot) ** 2)
+        rmse = np.sqrt(mse)
         print(f'예측 MSE: {mse:.6f}')
+        print(f'예측 RMSE: {rmse:.6f}')
+        
+        # 데이터 범위 대비 상대적 오차
+        data_range = x1_true_plot.max() - x1_true_plot.min()
+        relative_error = rmse / data_range * 100
+        print(f'상대적 오차: {relative_error:.2f}%')
 
     except Exception as e:
         print(f"시뮬레이션 중 오류 발생: {e}")
         print(f"초기 조건에서 시스템이 불안정할 수 있습니다.")
+
+
+def evaluate_extrapolation_performance(model, metadata, num_trials=5, t_end=10, t_start_plot=2, delta=0.005):
+    """
+    랜덤 초기 조건에 대해 extrapolation 성능을 평가하는 함수
+    논문의 성능 측정 방법: np.linalg.norm(X_ext-Xpred_ext) / np.linalg.norm(X_ext)
+    
+    Args:
+        model: 학습된 dAMZ 모델
+        metadata: Lorenz 96 시스템의 메타데이터
+        num_trials: 평가할 랜덤 초기 조건의 수
+        t_end: 적분 끝 시간
+        t_start_plot: 시각화 시작 시간
+        delta: 시간 간격
+    
+    Returns:
+        performance_scores: 각 시도별 성능 점수 리스트
+        mean_performance: 평균 성능 점수
+    """
+    # 시스템 파라미터 추출
+    K = metadata['K']
+    J = metadata['J']
+    F = metadata['F']
+    h = metadata['h']
+    b = metadata['b']
+    c = metadata['c']
+    dt = metadata['dt']
+    
+    performance_scores = []
+    
+    print(f"\n=== Extrapolation 성능 평가 (랜덤 초기 조건 {num_trials}개) ===")
+    
+    for trial in range(num_trials):
+        print(f"\n--- 시도 {trial + 1}/{num_trials} ---")
+        
+        # 랜덤 초기 조건 생성
+        np.random.seed(42 + trial)  # 재현성을 위한 시드 설정
+        
+        # X 초기 조건: 논문과 유사한 범위로 설정
+        X_init = np.random.uniform(-5, 5, K)
+        
+        # Y 초기 조건: 작은 값으로 설정
+        Y_init = np.random.uniform(-0.1, 0.1, K * J)
+        
+        initial_condition = np.concatenate([X_init, Y_init])
+        print(f"초기 조건 X: {X_init}")
+        print(f"초기 조건 Y 범위: [{Y_init.min():.3f}, {Y_init.max():.3f}]")
+
+        # 실제 시뮬레이션
+        t_eval = np.arange(0, t_end + delta, delta)
+        t_span = (0, t_end)
+
+        try:
+            # Lorenz 96 시스템 적분
+            sol = solve_ivp(
+                fun=lambda t, y: lorenz96_system_equations(t, y, F, h, b, c, K, J),
+                t_span=t_span,
+                y0=initial_condition,
+                t_eval=t_eval,
+                method='RK45',
+                rtol=1e-9,
+                atol=1e-11
+            )
+
+            t_vals = sol.t
+            X_true = sol.y[:K, :].T  # X 변수들만 추출
+
+            # 시스템 발산 감지
+            if np.any(np.abs(X_true) > 1000) or len(t_vals) < t_end / delta * 0.5:
+                print("경고: 시스템이 발산했습니다. 이 시도는 건너뜁니다.")
+                continue
+
+            # 모델 예측
+            model.eval()
+            n_M = int(0.05 / dt)  # 메모리 길이
+
+            X_pred = []
+            with torch.no_grad():
+                for i in range(n_M + 1, len(X_true)):
+                    # Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
+                    Z_input = X_true[i-n_M-1:i].reshape(-1)  # [D]
+                    Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)  # [1, D]
+
+                    # 예측
+                    z_pred = model(Z_tensor)
+                    X_pred.append(z_pred[0].numpy())
+
+            X_pred = np.array(X_pred)
+            t_pred = t_vals[n_M + 1:]
+            
+            # extrapolation 구간 설정 (t_start_plot 이후)
+            mask = (t_pred >= t_start_plot)
+            X_ext = X_true[n_M + 1:][mask]  # 실제 extrapolation 데이터
+            Xpred_ext = X_pred[mask]  # 예측 extrapolation 데이터
+
+            if len(X_ext) == 0:
+                print("경고: extrapolation 데이터가 없습니다!")
+                continue
+
+            # 논문의 성능 측정 방법 적용
+            # np.linalg.norm(X_ext-Xpred_ext) / np.linalg.norm(X_ext)
+            numerator = np.linalg.norm(X_ext - Xpred_ext)
+            denominator = np.linalg.norm(X_ext)
+            
+            if denominator == 0:
+                print("경고: 분모가 0입니다!")
+                continue
+                
+            performance_score = numerator / denominator
+            performance_scores.append(performance_score)
+            
+            print(f"Extrapolation 성능 점수: {performance_score:.6f}")
+            print(f"  - 분자 (예측 오차 norm): {numerator:.6f}")
+            print(f"  - 분모 (실제 데이터 norm): {denominator:.6f}")
+            print(f"  - 데이터 포인트 수: {len(X_ext)}")
+
+        except Exception as e:
+            print(f"시뮬레이션 중 오류 발생: {e}")
+            continue
+
+    # 평균 성능 계산
+    if len(performance_scores) > 0:
+        mean_performance = np.mean(performance_scores)
+        std_performance = np.std(performance_scores)
+        
+        print(f"\n=== 최종 결과 ===")
+        print(f"성공한 시도 수: {len(performance_scores)}/{num_trials}")
+        print(f"개별 성능 점수: {[f'{score:.6f}' for score in performance_scores]}")
+        print(f"평균 성능 점수: {mean_performance:.6f}")
+        print(f"성능 점수 표준편차: {std_performance:.6f}")
+        
+        return performance_scores, mean_performance
+    else:
+        print("성공한 시도가 없습니다!")
+        return [], None
 
 
 def simulate_and_plot_lorenz96_all_variables(model, metadata, t_end=10, t_start_plot=2, delta=0.005):
@@ -767,9 +909,17 @@ def simulate_and_plot_lorenz96_all_variables(model, metadata, t_end=10, t_start_
         plt.tight_layout()
         plt.show()
 
-        # 전체 MSE 계산
+        # 전체 MSE 및 RMSE 계산
         mse_total = np.mean((X_true_plot - X_pred_plot) ** 2)
+        rmse_total = np.sqrt(mse_total)
         print(f'전체 예측 MSE: {mse_total:.6f}')
+        print(f'전체 예측 RMSE: {rmse_total:.6f}')
+        
+        # 각 변수별 MSE 계산
+        for i in range(K):
+            mse_var = np.mean((X_true_plot[:, i] - X_pred_plot[:, i]) ** 2)
+            rmse_var = np.sqrt(mse_var)
+            print(f'변수 {i+1} MSE: {mse_var:.6f}, RMSE: {rmse_var:.6f}')
 
     except Exception as e:
         print(f"시뮬레이션 중 오류 발생: {e}")
@@ -943,3 +1093,7 @@ if __name__ == "__main__":
         # 모든 변수 시각화
         print("\n--- 모든 변수 예측 ---")
         simulate_and_plot_lorenz96_all_variables(model, metadata, t_end=5, t_start_plot=1, delta=0.005)
+
+        # Extrapolation 성능 평가
+        print("\n[+] Extrapolation 성능 평가...")
+        evaluate_extrapolation_performance(model, metadata, num_trials=5, t_end=5, t_start_plot=1, delta=0.005)
