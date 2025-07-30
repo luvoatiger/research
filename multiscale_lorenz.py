@@ -508,7 +508,7 @@ if __name__ == "__main__":
 
     num_ic = 300  # 초기 조건 개수
     ic_interval = 10  # 적분의 마지막 포인트 이후 다음 적분을 시작할 초기 조건까지의 간격 (MTU)
-    forecast_time = 100  # # Hist_Deterministic.py의 nt = 각 초기 조건 별 적분 기간 (MTU) (100 / 0.005 = 20000)
+    forecast_time = 10  # # Hist_Deterministic.py의 nt = 각 초기 조건 별 적분 기간 (MTU) (10 / 0.005 = 20000)
     
     # 데이터 저장을 위한 배열 초기화
     # 메모리 효율성을 위해 결과를 점진적으로 저장
@@ -535,8 +535,8 @@ if __name__ == "__main__":
     # 모델 초기화
     model = L96(K, J, F=F, h=h, b=b, c=c, dt=dt)
     model.set_state(Xinit, Yinit)    
-    spinup_time = 100 # Hist_Deterministic.py의 nt_pre = (100 / 0.005 = 20000)
-
+    spinup_time = 3 # Hist_Deterministic.py의 nt_pre = (10 / 0.005 = 2000)
+    
     for i in tqdm(range(num_ic), desc="초기 조건 처리 중"):
         # 초기 조건 저장        
         ic_X[i] = model.X
@@ -548,7 +548,6 @@ if __name__ == "__main__":
         spinup_Y[i] = model.Y
         
         # t = 0으로 초기화 한 후, 10 MTU 동안 적분 후 마지막 상태 저장
-        model.t = 0
         X_forecast, Y_forecast, t_forecast, C_forecast = model.run(si, forecast_time, store=True, return_coupling=True)
         print(f"X_forecast: {X_forecast.shape}, Y_forecast: {Y_forecast.shape}, t_forecast: {t_forecast.shape}, C_forecast: {C_forecast.shape}")
         # 적분 결과 저장
@@ -587,9 +586,7 @@ if __name__ == "__main__":
     # 초기 조건 저장
     np.save(f"{results_dir}/ic_X.npy", ic_X)
     np.save(f"{results_dir}/ic_Y.npy", ic_Y)
-    np.save(f"{results_dir}/ic_X.npy", ic_X)
-    np.save(f"{results_dir}/ic_Y.npy", ic_Y)
-
+    
     # 메타데이터 저장
     metadata = {
         'K': K,

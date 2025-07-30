@@ -975,13 +975,13 @@ def simulate_and_plot_lorenz96_with_uncertainty(model, metadata, t_end=10, t_sta
         plt.fill_between(t_plot, 
                         x1_pred_mean_plot - 2*x1_pred_std_plot, 
                         x1_pred_mean_plot + 2*x1_pred_std_plot, 
-                        alpha=0.3, color='red', label='95% Confidence Interval')
+                        alpha=0.1, color='red', label='95% Confidence Interval')
         
         # 1 표준편차 구간
         plt.fill_between(t_plot, 
                         x1_pred_mean_plot - x1_pred_std_plot, 
                         x1_pred_mean_plot + x1_pred_std_plot, 
-                        alpha=0.5, color='red', label='±1σ Interval')
+                        alpha=0.1, color='red', label='±1σ Interval')
         
         plt.xlabel('time t')
         plt.ylabel('$X_1(t)$')

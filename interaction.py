@@ -1,538 +1,731 @@
-"""
-Baseline 모델(Learning subgrid-scale models with neural ordinary differential equations, Kim et al., 2023) 구현
-"""
 import os
-import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 import torch
+import torch.nn as nn
+from torchdde import integrate, AdaptiveStepSizeController, Dopri5
+from tqdm import tqdm
+import json
+import time
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
 
-from multiscale_lorenz import integrate_L96_2t_with_coupling
+# ===========================
+# 1. NDDE 모델 정의 (수학적 정의에 따른 구현)
+# ===========================
+class NDDE(nn.Module):
+    """
+    Neural Delay Differential Equation (NDDE) 모델
+    수학적 정의: dy/dt = f_theta(t, y(t), y(t-tau_1), ..., y(t-tau_n))
 
-class SubgridNNwithInteraction(torch.nn.Module):
-    def __init__(self, input_dim=36, hidden_dim=256, output_dim=36):
+    Args:
+        delays: 지연 시간들의 리스트 [tau_1, tau_2, ..., tau_n]
+        in_size: y(t)의 차원
+        out_size: dy/dt의 차원 (보통 in_size와 같음)
+        width_size: 은닉층의 너비
+        depth: 은닉층의 깊이
+    """
+    def __init__(self, delays, in_size, out_size, width_size=128, depth=3):
+        super().__init__()
+        self.delays = delays
+        self.in_size = in_size
+        self.out_size = out_size
+
+        # 입력 차원: 현재 상태 + 모든 지연 상태들
+        # in_dim = in_size * (1 + len(delays))
+        self.in_dim = in_size * (1 + len(delays))
+
+        # MLP 구성: depth개의 은닉층 + 출력층
+        layers = []
+        # 첫 번째 은닉층
+        layers.append(nn.Linear(self.in_dim, width_size))
+        layers.append(nn.LeakyReLU())
+
+        # 중간 은닉층들
+        for _ in range(depth - 1):
+            layers.append(nn.Linear(width_size, width_size))
+            layers.append(nn.LeakyReLU())
+
+        # 출력층
+        layers.append(nn.Linear(width_size, out_size))
+
+        self.mlp = nn.Sequential(*layers)
+
+        # 가중치 초기화
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """가중치 초기화"""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.xavier_uniform_(module.weight, gain=0.01)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+    def forward(self, t, z, func_args, *, history):
         """
-        Lorenz 96 시스템의 커플링 항을 근사하는 신경망 (interaction term 추가)
-        
+        NDDE forward pass
+
         Args:
-            input_dim (int): 입력 차원 (X 변수의 차원)
-            hidden_dim (int): 은닉층의 뉴런 수
-            output_dim (int): 출력 차원 (커플링 항의 차원)
-        """
-        super(SubgridNNwithInteraction, self).__init__()
-        self.input_dim = input_dim
-        
-        # 첫 번째 layer에서 원래 변수와 interaction을 함께 처리
-        self.fc1 = torch.nn.Linear(input_dim * 3, hidden_dim)  # [x, x*x_left, x*x_right] 입력
-        
-        # 이후 hidden layers
-        self.fc2 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.fc4 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.output = torch.nn.Linear(hidden_dim, output_dim)
+            t: 현재 시간
+            z: 현재 상태 y(t) [batch_size, in_size]
+            func_args: 추가 인수 (사용하지 않음)
+            history: 지연 상태들의 리스트 [y(t-tau_1), y(t-tau_2), ..., y(t-tau_n)]
+                    각각 [batch_size, in_size] 형태
 
-
-    def forward(self, x):
-        """
-        신경망 순전파
-        
-        Args:
-            x (torch.Tensor): 입력 텐서, 형태: [batch_size, input_dim]
-            
         Returns:
-            torch.Tensor: 예측된 커플링 항, 형태: [batch_size, output_dim]
+            dy/dt: [batch_size, out_size]
         """
-        # 이웃 상태와의 상호작용 계산
-        x_left = torch.roll(x, shifts=1, dims=-1)
-        x_right = torch.roll(x, shifts=-1, dims=-1)
-        
-        # 입력 단계에서 원래 변수와 상호작용을 결합
-        x_combined = torch.cat([x, x * x_left, x * x_right], dim=-1)
-        
-        # Neural network forward pass
-        h = torch.relu(self.fc1(x_combined))
-        h = torch.relu(self.fc2(h))
-        h = torch.relu(self.fc3(h))
-        h = torch.relu(self.fc4(h))
-        output = self.output(h)
-        
+        # 입력 데이터 검증
+        if torch.isnan(z).any() or torch.isinf(z).any():
+            print(f"경고: NDDE 현재 상태에 NaN/Inf가 포함되어 있습니다!")
+            return torch.zeros(z.shape[0], self.out_size, device=z.device)
+
+        for i, hist in enumerate(history):
+            if torch.isnan(hist).any() or torch.isinf(hist).any():
+                print(f"경고: NDDE 지연 상태 {i}에 NaN/Inf가 포함되어 있습니다!")
+                return torch.zeros(z.shape[0], self.out_size, device=z.device)
+
+        # 현재 상태와 모든 지연 상태들을 연결
+        # torch.cat([z, *history], dim=-1) 형태로 구현
+        concatenated = torch.cat([z, *history], dim=-1)
+
+        # MLP를 통한 f_theta 계산
+        output = self.mlp(concatenated)
+
+        # 출력 데이터 검증
+        if torch.isnan(output).any() or torch.isinf(output).any():
+            print(f"경고: NDDE 출력에 NaN/Inf가 포함되어 있습니다!")
+            return torch.zeros(z.shape[0], self.out_size, device=z.device)
+
         return output
 
 
-class NeuralLorenz96(torch.nn.Module):
-    def __init__(self, subgrid_nn):
-        super(NeuralLorenz96, self).__init__()
-        self.subgrid_nn = subgrid_nn
+# ===========================
+# 2. Lorenz 96 시스템과 NDDE 결합
+# ===========================
+class Lorenz96NDDE(nn.Module):
+    """
+    Lorenz 96 시스템과 NDDE를 결합한 모델
+    dx/dt = Lorenz96_markov(x) + NDDE_memory(x, x(t-tau_1), ..., x(t-tau_n))
+    """
+    def __init__(self, delays, K, J, F, h, b, c, width_size=128, depth=3):
+        super().__init__()
+        self.K = K
+        self.J = J
+        self.delays = delays
 
+        # Lorenz 96 시스템 파라미터 (metadata에서 가져옴)
+        self.F = F      # 강제 항 파라미터
+        self.h = h      # 결합 강도
+        self.b = b      # Y 변수 스케일링
+        self.c = c      # Y 변수 시간 스케일
 
-    def neural_L96_2t_xdot_ydot(self, X, Y, K, J, h, F, c, b, neural_coupling):
+        # NDDE 메모리 항
+        self.ndde = NDDE(delays=delays, in_size=K, out_size=K,
+                        width_size=width_size, depth=depth)
+
+    def forward(self, t, x, func_args, *, history):
         """
-        Lorenz-96 two-timescale 모델의 미분 방정식을 계산하는 함수 (신경망 서브그리드 모델 사용)
-        
-        Args:
-            X: 큰 스케일 변수 (shape: [batch_size, length, K])
-            Y: 작은 스케일 변수 (shape: [batch_size, length, K*J])
-            K: 큰 스케일 변수의 수
-            J: 각 큰 스케일 변수에 연결된 작은 스케일 변수의 수
-            h: 커플링 계수
-            F: 외부 강제력
-            c: 시간 스케일 비율
-            b: 공간 스케일 비율
-            neural_coupling: 신경망 커플링 항
-
-        Returns:
-            Xdot: X의 시간 미분 (shape: [batch_size, length, K])
-            Ydot: Y의 시간 미분 (shape: [batch_size, length, K*J])
-        """
-        # 모든 입력이 PyTorch 텐서인지 확인
-        device = X.device
-        if not isinstance(F, torch.Tensor):
-            F = torch.tensor(F, dtype=torch.float32, device=device)
-        if not isinstance(h, torch.Tensor):
-            h = torch.tensor(h, dtype=torch.float32, device=device)
-        if not isinstance(c, torch.Tensor):
-            c = torch.tensor(c, dtype=torch.float32, device=device)
-                
-        # X의 미분 계산 (PyTorch 연산 사용)
-        X_minus_1 = torch.roll(X, shifts=1, dims=0)
-        X_plus_1 = torch.roll(X, shifts=-1, dims=0)
-        X_minus_2 = torch.roll(X, shifts=2, dims=0)
-
-        Xdot = X_minus_1 * (X_plus_1 - X_minus_2) - X + F + neural_coupling
-        
-        # Y의 미분 계산
-        # Y_plus_1, Y_plus_2, Y_minus_1 계산 (마지막 차원에 대해 roll)
-        Y_plus_1 = torch.roll(Y, shifts=-1, dims=-1)
-        Y_plus_2 = torch.roll(Y, shifts=-2, dims=-1)
-        Y_minus_1 = torch.roll(Y, shifts=1, dims=-1)
-        
-        # X를 반복하여 Y와 같은 차원으로 확장
-        X_repeated = torch.repeat_interleave(X, J, dim=-1)
-          
-        # Ydot 계산
-        hcJ = h * c / J
-        Ydot = -c * J * Y_plus_1 * (Y_plus_2 - Y_minus_1) - c * Y + hcJ * X_repeated
-        
-        return Xdot, Ydot, neural_coupling
-
-
-    def integrate_L96_2t_with_neural_coupling(self, X0, Y0, F, h, b, c, dt=0.001, neural_coupling=None):
-        """
-        Integrates forward-in-time the two time-scale Lorenz 1996 model, using the RK4 integration method.
-        Returns the full history with nt+1 values starting with initial conditions, X[:,0]=X0 and Y[:,0]=Y0,
-        and ending with the final state, X[:,nt+1] and Y[:,nt+1] at time t0+nt*si.
-
-        Note the model is intergratedL
+        Lorenz 96 + NDDE forward pass
 
         Args:
-            X0 : Values of X variables at the current time
-            Y0 : Values of Y variables at the current time
-            F  : Forcing term
-            h  : coupling coefficient
-            b  : ratio of amplitudes
-            c  : time-scale ratio
-            dt : The actual time step. If dt<si, then si is used. Otherwise si/dt must be a whole number. Default 0.001.
+            t: 현재 시간
+            x: 현재 상태 [batch_size, K]
+            func_args: 추가 인수
+            history: 지연 상태들의 리스트
 
         Returns:
-            X[:,:], Y[:,:], time[:], hcbY[:,:] : the full history X[n,k] and Y[n,k] at times t[n], and coupling term
-
-        Example usage:
-            X,Y,t,_ = integrate_L96_2t_with_coupling(5+5*np.random.rand(8), np.random.rand(8*4), 0.01, 500, 18, 1, 10, 10)
-            plt.plot( t, X);
+            dx/dt: [batch_size, K]
         """
+        # Lorenz 96 Markov 항 계산
+        markov_term = self.lorenz96_markov(x)
 
-        xhist, yhist = torch.zeros(X0.shape), torch.zeros(Y0.shape)
+        # NDDE 메모리 항 계산
+        memory_term = self.ndde(t, x, func_args, history=history)
 
-        X, Y = X0[0], Y0[0]
-        xhist[0] = X
-        yhist[0] = Y
+        # 전체 미분 계산
+        dxdt = markov_term + memory_term
 
-        K = X0.shape[1]
-        J = Y0.shape[1] // X0.shape[1]
+        return dxdt
 
-        for n in range(1, X0.shape[0]):
-            # RK4 update of X,Y
-            Xdot1, Ydot1, _ = self.neural_L96_2t_xdot_ydot(X, Y, K, J, h, F, c, b, neural_coupling[n-1])
-            Xdot2, Ydot2, _ = self.neural_L96_2t_xdot_ydot(
-                X + 0.5 * dt * Xdot1, Y + 0.5 * dt * Ydot1, K, J, h, F, c, b, neural_coupling[n-1]
-            )
-            Xdot3, Ydot3, _ = self.neural_L96_2t_xdot_ydot(
-                X + 0.5 * dt * Xdot2, Y + 0.5 * dt * Ydot2, K, J, h, F, c, b, neural_coupling[n-1]
-            )
-            Xdot4, Ydot4, _ = self.neural_L96_2t_xdot_ydot(
-                X + dt * Xdot3, Y + dt * Ydot3, K, J, h, F, c, b, neural_coupling[n-1]
-            )
-            X = X + (dt / 6.0) * ((Xdot1 + Xdot4) + 2.0 * (Xdot2 + Xdot3))
-            Y = Y + (dt / 6.0) * ((Ydot1 + Ydot4) + 2.0 * (Ydot2 + Ydot3))
+    def lorenz96_markov(self, x):
+        """
+        Lorenz 96 시스템의 Markov 항 계산
+        metadata의 파라미터들을 사용하여 정확한 Lorenz 96 시스템 구현
+        """
+        K = x.shape[1]
+        roll_p1 = torch.roll(x, shifts=-1, dims=1)
+        roll_m2 = torch.roll(x, shifts=2, dims=1)
+        roll_m1 = torch.roll(x, shifts=1, dims=1)
 
-            xhist[n], yhist[n] = (X, Y)
+        # 정확한 Lorenz 96 Markov 항 계산
+        # dX[k] = (X[(k+1) % K] - X[(k-2) % K]) * X[(k-1) % K] - X[k] + F
+        result = (roll_p1 - roll_m2) * roll_m1 - x + self.F
 
-        return xhist, yhist
-
-def calculate_loss(batch_X_data, batch_Y_data, predicted_X_data, predicted_Y_data):
-    batch_size = len(predicted_X_data)
-    m_delta_t = len(predicted_X_data[0])
-
-    predicted_X_tensor = torch.stack(predicted_X_data)
-    predicted_Y_tensor = torch.stack(predicted_Y_data)
-
-    # X와 Y를 합쳐서 Z 텐서 생성
-    predicted_Z_tensor = torch.cat([predicted_X_tensor, predicted_Y_tensor], dim=-1)
-    batch_Z_data = torch.cat([batch_X_data, batch_Y_data], dim=-1)
-
-    # Z에 대한 제곱 오차 계산
-    Z_squared_norms = torch.sum((predicted_Z_tensor - batch_Z_data)**2, dim=-1)  # [batch_size, m_delta_t]
-
-    # MSE 손실 계산: (1/nm) * sum_{i=1}^n sum_{t=1}^m ||Z_t^(i) - Z_hat_t^(i)||^2
-    loss = torch.sum(Z_squared_norms) / (batch_size * m_delta_t)
-
-    return loss
+        return result
 
 
-def compare_coupling_terms(model_path, data_dir, batch_indices=None, time_steps=1000, save_path=None):
+# ===========================
+# 3. 데이터 전처리
+# ===========================
+def load_l96_data(data_dir: str, N: int = 300):
     """
-    학습 데이터를 이용하여 학습된 커플링 항과 실제 커플링 항을 비교하는 함수
-    
+    Lorenz 96 데이터 로딩
+
     Args:
-        model_path: 학습된 모델 경로
-        data_dir: 학습 데이터가 저장된 디렉토리
-        batch_indices: 비교할 배치 인덱스 리스트 (None인 경우 첫 번째 배치 사용)
-        time_steps: 시각화할 시간 단계 수
-        save_path: 그래프 저장 경로 (None인 경우 저장하지 않음)
-    
+        data_dir (str): 데이터 디렉토리 경로
+        N (int): 로딩할 배치 수
+
     Returns:
-        fig1, fig2: 생성된 그래프 객체들
+        list: 데이터 리스트
     """
-    # 모델 로드
-    subgrid_nn = SubgridNNwithInteraction()
-    model = NeuralLorenz96(subgrid_nn)
-    model.load_state_dict(torch.load(model_path))
-    model.eval()  # 평가 모드로 설정
-    
-    # 배치 인덱스가 지정되지 않은 경우 첫 번째 배치 사용
-    if batch_indices is None:
-        batch_indices = [1]  # 첫 번째 배치
-    
-    # 데이터 로드 및 준비
-    all_X_data = []
-    all_true_coupling = []
-    
-    for idx in batch_indices:
-        X_data = np.load(os.path.join(data_dir, f"X_batch_{idx}.npy"))
-        C_data = np.load(os.path.join(data_dir, f"C_batch_{idx}.npy"))
-        
-        all_X_data.append(X_data)
-        all_true_coupling.append(C_data)
-    
-    # 데이터 결합
-    X_data = np.concatenate(all_X_data, axis=0)
-    true_coupling = np.concatenate(all_true_coupling, axis=0)
-    
-    # 텐서로 변환
-    X_tensor = torch.from_numpy(X_data).float()
-    true_coupling_tensor = torch.from_numpy(true_coupling).float()
-    
-    # 배치 차원 제거 (필요한 경우)
-    if X_tensor.dim() > 2:
-        X_tensor = X_tensor.reshape(-1, X_tensor.shape[-1])
-        true_coupling_tensor = true_coupling_tensor.reshape(-1, true_coupling_tensor.shape[-1])
-    
-    # 예측된 커플링 항 계산
-    with torch.no_grad():
-        predicted_coupling_tensor = model.subgrid_nn(X_tensor)
-    
-    # NumPy 배열로 변환
-    true_coupling_np = true_coupling_tensor.numpy()
-    predicted_coupling_np = predicted_coupling_tensor.numpy()
-    
-    # 차이 계산
-    difference = true_coupling_np - predicted_coupling_np
-    
-    
-    # 시각화 1: 커플링 항 비교
-    fig1, axes = plt.subplots(3, 1, figsize=(10, 12))
-    
-    # 컬러맵 설정
-    cmap1 = plt.cm.viridis
-    cmap2 = plt.cm.coolwarm
-    
-    # 실제 커플링 항 (S)
-    im1 = axes[0].imshow(true_coupling_np.T, aspect='auto', cmap=cmap1, 
-                         interpolation='none', origin='lower')
-    axes[0].set_ylabel('$S$')
-    axes[0].set_title('True Coupling Term')
-    plt.colorbar(im1, ax=axes[0])
-    
-    # 예측된 커플링 항 (S_θ)
-    im2 = axes[1].imshow(predicted_coupling_np.T, aspect='auto', cmap=cmap1, 
-                         interpolation='none', origin='lower')
-    axes[1].set_ylabel('$S_\\theta$')
-    axes[1].set_title('Predicted Coupling Term (Neural Network)')
-    plt.colorbar(im2, ax=axes[1])
-    
-    # 차이 (S - S_θ)
-    # 차이의 최대 절대값을 기준으로 컬러맵 범위 설정
-    max_diff = max(abs(difference.min()), abs(difference.max()))
-    im3 = axes[2].imshow(difference.T, aspect='auto', cmap=cmap2, 
-                         interpolation='none', origin='lower',
-                         vmin=-max_diff, vmax=max_diff)
-    axes[2].set_xlabel('Time')
-    axes[2].set_ylabel('$S - S_\\theta$')
-    axes[2].set_title(f'Difference')
-    plt.colorbar(im3, ax=axes[2])
-    
-    plt.tight_layout()
-    
-    # 그래프 저장
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    
-    # 시각화 2: 차이값의 분포도
-    fig2, axes2 = plt.subplots(figsize=(10, 10))
-    
-    # 차이값 히스토그램 및 KDE
-    sns.histplot(difference.flatten(), kde=True, ax=axes2, color='blue', bins=100)
-    axes2.set_title('Distribution of Differences (S - S_θ)')
-    axes2.set_xlabel('Difference Value')
-    axes2.set_ylabel('Frequency')
-       
-    plt.tight_layout()
-    
-    # 분포도 그래프 저장
-    if save_path:
-        distribution_save_path = save_path.replace('.png', '_distribution.png')
-        plt.savefig(distribution_save_path, dpi=300, bbox_inches='tight')
-    
-    plt.show()
-    
-    print(f"차이값 통계:")
-    print(f"  최소값: {difference.min():.4f}")
-    print(f"  최대값: {difference.max():.4f}")
-    print(f"  평균: {difference.mean():.4f}")
-    print(f"  표준편차: {difference.std():.4f}")
-        
-    return fig1, fig2
-    
-
-
-def plot_hovmoller_diagram(model_path, data_dir, batch_idx=1, save_path=None):
-    """
-    Lorenz 96 모델의 느린 변수(X)에 대한 Hovmöller 다이어그램을 생성하는 함수
-    
-    Args:
-        model_path: 학습된 모델 경로
-        data_dir: 테스트 데이터가 저장된 디렉토리
-        batch_idx: 사용할 배치 인덱스
-        save_path: 그래프 저장 경로 (None인 경우 저장하지 않음)
-    
-    Returns:
-        fig: 생성된 그래프 객체
-    """
-    # 모델 로드
-    subgrid_nn = SubgridNNwithInteraction()
-    model = NeuralLorenz96(subgrid_nn)
-    model.load_state_dict(torch.load(model_path))
-    model.eval()  # 평가 모드로 설정
-    
-    # 파라미터 설정
-    K = 36  # 느린 변수(X)의 수
-    F = 20  # 외부 강제력
-    h = 1.0  # 커플링 계수
-    b = 10   # 진폭 비율
-    c = 10   # 시간 스케일 비율
-    dt = 0.005  # 기본 시간 간격
-
-    large_dt = 10*dt
-
-    # 데이터 로드
-    X_data = np.load(os.path.join(data_dir, f"X_batch_{batch_idx}.npy"))
-    Y_data = np.load(os.path.join(data_dir, f"Y_batch_{batch_idx}.npy"))
-    C_data = np.load(os.path.join(data_dir, f"C_batch_{batch_idx}.npy"))
-
-    X_data = torch.from_numpy(X_data).float()
-    Y_data = torch.from_numpy(Y_data).float()
-    C_data = torch.from_numpy(C_data).float()
-    
-    # 입력 텐서의 shape이 [batch_size, timestep, features]인 경우 [timestep, features]로 차원 축소
-    if len(X_data.shape) > 2:  # 3차원 텐서인 경우
-        X_data = X_data[0]
-        Y_data = Y_data[0]
-        C_data = C_data[0]
-
-    predicted_X, _ = model.integrate_L96_2t_with_neural_coupling(
-        X_data,
-        Y_data,
-        F,
-        h,
-        b,
-        c,
-        dt=large_dt,
-        neural_coupling=model.subgrid_nn(X_data)
-    )
-    
-    # 10dt로 적분된 predicted_X에서 200 인덱스까지만 슬라이싱(=2000개의 데이터 포인트)
-    predicted_X = predicted_X.detach().numpy()
-    
-    predicted_X = predicted_X[:200]
-
-    # X_data에서 10 인덱스 간격으로 샘플링한 데이터 포인트 추출
-    X_data_sampled = X_data[::10][:200]
-
-    # 예측값과 샘플링된 실제 데이터의 차이 계산
-    diff_X = X_data_sampled - predicted_X
-    
-    # 논문과 같은 스타일로 Hovmöller 다이어그램 생성
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-    
-    # 컬러맵 설정
-    cmap1 = plt.cm.viridis  # 상단 및 중간 패널용
-    cmap2 = plt.cm.coolwarm  # 하단 패널용
-        
-    # 실제 X 값 (True X)
-    im1 = axes[0].imshow(X_data.T, aspect='auto', cmap=cmap1, 
-                         interpolation='none', origin='lower',
-                         extent=[0, 10, 0, K], vmin=-10, vmax=10)
-    axes[0].set_ylabel('True X')
-    fig.colorbar(im1, ax=axes[0], orientation='vertical', pad=0.01)
-    
-    # 예측된 X 값 (Pred X̂)
-    im2 = axes[1].imshow(predicted_X.T, aspect='auto', cmap=cmap1, 
-                         interpolation='none', origin='lower',
-                         extent=[0, 10, 0, K], vmin=-10, vmax=10)
-    axes[1].set_ylabel('Pred X̂')
-    fig.colorbar(im2, ax=axes[1], orientation='vertical', pad=0.01)
-    
-    # 차이 (X - X̂)
-    # 차이의 최대 절대값을 기준으로 컬러맵 범위 설정
-    max_diff = 20  # 논문과 같은 스케일 사용
-    im3 = axes[2].imshow(diff_X.T, aspect='auto', cmap=cmap2, 
-                         interpolation='none', origin='lower',
-                         extent=[0, 10, 0, K],
-                         vmin=-max_diff, vmax=max_diff)
-    axes[2].set_xlabel('Time')
-    axes[2].set_ylabel('X - X̂')
-    fig.colorbar(im3, ax=axes[2], orientation='vertical', pad=0.01)
-    
-    # 레이아웃 조정
-    plt.tight_layout()
-    
-    # 그래프 저장
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    
-    plt.show()
-    
-    return fig
-
-
-if __name__ == "__main__":
-    '''
-    # 파라미터 설정
-    m_delta_t = 5
-    batch_size = 100
-    num_epoch = 3000
-
-    # Kang's experimental setup
-    K = 36  # Number of globa-scale variables X
-    J = 10  # Number of local-scale Y variables per single global-scale X variable
-    F = 20  # Forcing
-    h = 1.0  # Coupling coefficient
-    b = 10    # Ratio of amplitudes
-    
-    T = 10
-    si = 0.005
-    nt = int(T / si)
-
-    c = 10    # time-scale ratio 설정
-
-    # 데이터 로드
     data_list = []
-    for i in range(1, 301):
-        X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_{i}.npy"))
-        Y_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"Y_batch_{i}.npy"))
-        t_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"t_batch_{i}.npy"))
-        C_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"C_batch_{i}.npy"))
-        data_list.append([X_data, Y_data, C_data, t_data])
+    print(f"[+] 데이터 로딩 시작: {data_dir}")
 
-    model = NeuralLorenz96(SubgridNNwithInteraction())
-    optimizer = torch.optim.Adam(model.subgrid_nn.parameters(), lr=0.001)
-    criterion = torch.nn.MSELoss()        
-    losses = []
+    for i in range(1, N + 1):
+        x_data_path = os.path.join(data_dir, f"X_batch_{i}.npy")
+        t_data_path = os.path.join(data_dir, f"t_batch_{i}.npy")
+        if not os.path.exists(x_data_path):
+            print(f"경고: 파일이 존재하지 않습니다: {x_data_path}")
+            continue
 
-    
-    # 데이터를 batch_size 만큼 묶어서 학습
-    for n in range(num_epoch):
-        # batch_size가 100이므로, 0부터 300 사이에 있는 100개의 정수를 랜덤으로 추출
-        sample_idx = np.random.choice(np.arange(300), size=100, replace=False)
-        batch = []
+        try:
+            X = np.load(x_data_path)[0]  # shape: [T, K]
+            t = np.load(t_data_path)[0]  # shape: [T]
 
-        # random_start_point 설정
-        random_start_point = np.random.randint(0, len(X_data[0]) - m_delta_t)
-        for idx in sample_idx:
-            # 전체 데이터에서 해당 idx의 X_data, Y_data, t_data, C_data 데이터를 텐서로 변환
-            X_data = torch.from_numpy(data_list[idx][0]).float()
-            Y_data = torch.from_numpy(data_list[idx][1]).float()
-            C_data = torch.from_numpy(data_list[idx][2]).float()
-            t_data = torch.from_numpy(data_list[idx][3]).float()
-            # ramdom_start_point 에서 m_delta_t 만큼의 데이터를 해당 idx의 데이터에서 추출
-            sliced_X_data = X_data[:, random_start_point:random_start_point + m_delta_t, :]
-            sliced_Y_data = Y_data[:, random_start_point:random_start_point + m_delta_t, :]
-            sliced_C_data = C_data[:, random_start_point:random_start_point + m_delta_t, :]
-            sliced_t_data = t_data[:, random_start_point:random_start_point + m_delta_t, :]
-            # batch 데이터 추가
-            batch.append([sliced_X_data, sliced_Y_data, sliced_C_data, sliced_t_data])
+            # 데이터 검증
+            if np.isnan(X).any() or np.isinf(X).any():
+                print(f"경고: 배치 {i}에 NaN/Inf가 포함되어 있습니다!")
+                print(f"데이터 범위: [{X.min():.4f}, {X.max():.4f}]")
+                continue
 
-        # batch 데이터를 텐서로 변환(batch_size, m_delta_t, X_dim)
-        batch_X_data = torch.stack([batch[i][0] for i in range(batch_size)]).squeeze(1)
-        batch_Y_data = torch.stack([batch[i][1] for i in range(batch_size)]).squeeze(1)
-        batch_C_data = torch.stack([batch[i][2] for i in range(batch_size)]).squeeze(1)
-        batch_t_data = torch.stack([batch[i][3] for i in range(batch_size)]).squeeze(1)
-        # 커플링 항 예측
-        predicted_batch_C = model.subgrid_nn(batch_X_data)
+            data_list.append((X, t) )
 
-        # batch의 개별 X, Y 데이터와 예측된 커플링 항을 이용해서 시스템 정수해(X, Y) 계산
-        predicted_X_data = []
-        predicted_Y_data = []
+        except Exception as e:
+            print(f"경고: 배치 {i} 로딩 중 오류 발생: {e}")
+            continue
 
-        for i in range(batch_size):
-            predicted_X, predicted_Y = model.integrate_L96_2t_with_neural_coupling(batch_X_data[i], batch_Y_data[i], batch_t_data[i], si, nt, F, h, b, c, dt=0.005, neural_coupling=predicted_batch_C[i])
-            predicted_X_data.append(predicted_X)
-            predicted_Y_data.append(predicted_Y)
+    print(f"[+] 성공적으로 로딩된 배치 수: {len(data_list)}/{N}")
+    if len(data_list) == 0:
+        raise ValueError("로딩된 데이터가 없습니다!")
 
-        loss = calculate_loss(batch_X_data, batch_Y_data, predicted_X_data, predicted_Y_data)
+    return data_list
+
+
+def preprocess_trajectories_for_ndde(data_list, sequence_length=200, num_sequences_per_traj=3, dt=0.01, seed=42, use_real_time=False):
+    """
+    로딩된 trajectory들을 Neural DDE 학습에 맞게 전처리
+    각 trajectory에서 랜덤하게 슬라이싱하여 sequence들을 생성
+
+    Args:
+        data_list: load_l96_data로 로딩된 trajectory 리스트 (X, t) 튜플
+        sequence_length: 각 sequence의 길이
+        num_sequences_per_traj: 각 trajectory에서 추출할 sequence 개수
+        dt: 시간 간격 (use_real_time=False일 때만 사용)
+        seed: 랜덤 시드
+        use_real_time: 실제 시간 데이터 사용 여부
+
+    Returns:
+        tuple: (ts, ys) - 시간 구간과 전처리된 sequence들
+    """
+    np.random.seed(seed)
+    print(f"[+] Neural DDE용 데이터 전처리 시작...")
+    print(f"  - 원본 trajectory 수: {len(data_list)}")
+    print(f"  - Sequence 길이: {sequence_length}")
+    print(f"  - Trajectory당 sequence 수: {num_sequences_per_traj}")
+    print(f"  - 실제 시간 사용: {use_real_time}")
+
+    processed_sequences = []
+    processed_times = []  # 실제 시간 데이터 저장
+    total_sequences = 0
+
+    for i, (X, t) in enumerate(data_list):
+        # 데이터 검증
+        if np.isnan(X).any() or np.isinf(X).any():
+            print(f"경고: trajectory {i}에 NaN/Inf가 포함되어 있습니다!")
+            continue
+
+        T = len(X)
         
-        # 오차 역전파
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # sequence_length보다 짧은 trajectory는 건너뛰기
+        if T < sequence_length:
+            print(f"경고: trajectory {i}가 너무 짧습니다 (길이: {T})")
+            continue
 
-        # 학습 과정 출력
-        print(f"Epoch {n+1}/{num_epoch}, Loss: {loss.item()}")
-        losses.append(loss.item())
-    # 학습된 모델 저장
-    os.makedirs(os.path.join(os.getcwd(), "interaction_models"), exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(os.getcwd(), "interaction_models", "subgrid_nn.pth"))   
+        # 겹치지 않는 랜덤 시작점들 생성
+        max_start_idx = T - sequence_length
+        if max_start_idx < num_sequences_per_traj:
+            # 가능한 sequence 수가 요청된 수보다 적은 경우
+            num_sequences = max_start_idx + 1
+            start_indices = list(range(num_sequences))
+        else:
+            # 랜덤하게 시작점 선택 (겹치지 않도록)
+            start_indices = np.random.choice(max_start_idx + 1, 
+                                           size=min(num_sequences_per_traj, max_start_idx + 1), 
+                                           replace=False)
 
-    plt.title("Loss")
-    plt.plot(losses)
-    plt.savefig(os.path.join(os.getcwd(), "interaction_models", "loss.png"))
+        # 각 시작점에서 sequence 추출
+        for start_idx in start_indices:
+            end_idx = start_idx + sequence_length
+            
+            # sequence 추출
+            sequence = X[start_idx:end_idx]
+            
+            # 데이터 검증
+            if np.isnan(sequence).any() or np.isinf(sequence).any():
+                print(f"경고: trajectory {i}의 sequence {start_idx}-{end_idx}에 NaN/Inf가 포함되어 있습니다!")
+                continue
+            
+            processed_sequences.append(sequence)
+            
+            # 실제 시간 데이터도 추출
+            if use_real_time:
+                time_sequence = t[start_idx:end_idx]
+                processed_times.append(time_sequence)
+            
+            total_sequences += 1
+
+    if len(processed_sequences) == 0:
+        raise ValueError("전처리된 유효한 sequence가 없습니다!")
+
+    # 시간 구간 생성
+    if use_real_time:
+        # 실제 시간 데이터 사용 (첫 번째 sequence의 시간을 기준으로)
+        ts = torch.tensor(processed_times[0], dtype=torch.float32)
+        print(f"  - 실제 시간 범위: [{ts[0]:.4f}, {ts[-1]:.4f}]")
+    else:
+        # 균등한 시간 간격 생성
+        ts = torch.linspace(0, (sequence_length-1) * dt, sequence_length)
+        print(f"  - 균등 시간 간격: [{ts[0]:.4f}, {ts[-1]:.4f}]")
+
+    # 배치로 스택
+    ys = torch.tensor(np.stack(processed_sequences), dtype=torch.float32)  # [N, T, K]
+
+    print(f"[+] 데이터 전처리 완료:")
+    print(f"  - 생성된 sequence 수: {ys.shape[0]}")
+    print(f"  - 시간 스텝: {ys.shape[1]}")
+    print(f"  - 변수 수: {ys.shape[2]}")
+    print(f"  - 데이터 범위: [{ys.min():.4f}, {ys.max():.4f}]")
+    print(f"  - 총 sequence 수: {total_sequences}")
+
+    return ts, ys
+
+
+def create_fixed_delays(dt=0.01, num_delays=5):
+    """
+    고정된 지연 시간 생성 (dt에 맞게 설정)
+
+    Args:
+        dt: 시간 간격
+        num_delays: 지연 시간 개수
+
+    Returns:
+        torch.tensor: 고정된 지연 시간들
+    """
+    # dt에 맞게 1, 2, 3, 4, 5 스텝 뒤의 과거 값들을 가져오도록 설정
+    delays = torch.tensor([np.round(dt * i, 4) for i in range(1, num_delays + 1)], dtype=torch.float32)
+
+    print(f"[+] 고정 지연 시간 생성:")
+    print(f"  - 지연 시간 개수: {num_delays}")
+    print(f"  - 시간 간격 (dt): {dt}")
+    print(f"  - 지연 시간들: {delays.tolist()}")
+
+    return delays
+
+
+class Lorenz96Dataset(torch.utils.data.Dataset):
+    """
+    Lorenz 96 데이터셋
+    """
+    def __init__(self, ys):
+        self.ys = ys
+
+    def __getitem__(self, index):
+        return self.ys[index]
+
+    def __len__(self):
+        return self.ys.shape[0]
+
+
+# ===========================
+# 5. NDDE 학습 함수 (torchdde 기반)
+# ===========================
+def train_lorenz96_ndde(
+    metadata,
+    dataset,
+    delays,
+    batch_size=32,
+    lr=0.001,
+    max_epoch=50,
+    width_size=128,
+    depth=3,
+    seed=42,
+    plot=True,
+    print_every=5,
+    device="cpu"
+):
+    """
+    Lorenz96NDDE 모델 학습 함수 (torchdde 기반)
+
+    Args:
+        metadata: Lorenz 96 시스템 메타데이터
+        dataset: 전처리된 데이터셋
+        delays: 학습 가능한 지연 시간 파라미터
+        batch_size: 배치 크기
+        lr: 학습률
+        max_epoch: 최대 에포크 수
+        width_size: 은닉층 너비
+        depth: 은닉층 깊이
+        seed: 랜덤 시드
+        plot: 시각화 여부
+        print_every: 로깅 간격
+        device: 디바이스
+
+    Returns:
+        tuple: (ts, ys, model, losses, delays_evol)
+    """
+    torch.manual_seed(seed)
+
+    # 데이터 추출
+    ts = dataset.ts
+    ys = dataset.ys
+
+    # 모델 생성
+    K = metadata['K']
+    J = metadata['J']
+    F = metadata['F']
+    h = metadata['h']
+    b = metadata['b']
+    c = metadata['c']
+
+    model = Lorenz96NDDE(
+        delays=delays,
+        K=K, J=J, F=F, h=h, b=b, c=c,
+        width_size=width_size, depth=depth
+    ).to(device)
+
+    print(f"[+] 모델 구성 완료:")
+    print(f"  - 모델 파라미터 수: {sum(p.numel() for p in model.parameters())}")
+
+    # 데이터로더 생성
+    train_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # 학습 설정
+    losses, delays_evol = [], []
+    loss_fn = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+
+    print(f"[+] 학습 시작: {max_epoch} 에포크, 배치 크기 {batch_size}")
+
+    # 학습 루프
+    for epoch in tqdm(range(max_epoch)):
+        model.train()
+        epoch_losses = []
+
+        for step, data in enumerate(train_loader):
+            start_time = time.time()
+            optimizer.zero_grad()
+
+            data = data.to(device)  # [batch_size, T, K]
+
+            # History 함수: 각 배치의 첫 번째 시간 스텝을 초기 조건으로 사용
+            history_fn = lambda t: data[:, 0]  # [batch_size, K]
+
+            try:
+                # NDDE 통합
+                ys_pred = integrate(
+                    model,
+                    Dopri5(),
+                    ts[0],
+                    ts[-1],
+                    ts,
+                    history_fn,
+                    func_args=None,
+                    dt0=ts[1] - ts[0],
+                    stepsize_controller=AdaptiveStepSizeController(1e-6, 1e-9),
+                    discretize_then_optimize=True,
+                    delays=delays,
+                )
+
+                # Loss 계산
+                loss = loss_fn(ys_pred, data)
+                epoch_losses.append(loss.item())
+
+                # 역전파
+                loss.backward()
+
+                # 그래디언트 클리핑
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                optimizer.step()
+
+                # 지연 시간은 고정이므로 기록하지 않음
+                # delays_evol.append(delays.clone().detach())  # 주석 처리
+
+            except Exception as e:
+                print(f"경고: 배치 {step} 처리 중 오류 발생: {e}")
+                continue
+
+        # 에포크 평균 손실 계산
+        if epoch_losses:
+            avg_loss = np.mean(epoch_losses)
+            losses.append(avg_loss)
+            scheduler.step(avg_loss)
+
+            # 로깅
+            if (epoch % print_every) == 0 or epoch == max_epoch - 1:
+                print(
+                    f"Epoch: {epoch:3d}/{max_epoch}, "
+                    f"Loss: {avg_loss:.6f}, "
+                    f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+                )
+
+    print(f"[+] 학습 완료! 최종 손실: {losses[-1]:.6f}")
+
+    # 시각화
+    if plot:
+        plot_training_results(ts, ys, model, losses, [], device)  # delays_evol은 빈 리스트로 전달
+
+    return ts, ys, model, losses, []
+
+
+def plot_training_results(ts, ys, model, losses, delays_evol, device):
+    """
+    학습 결과 시각화
+    """
+    model.eval()
+
+    # 테스트 예측
+    with torch.no_grad():
+        test_data = ys[0:1].to(device)  # 첫 번째 trajectory
+        history_fn = lambda t: test_data[:, 0]
+
+        ys_pred = integrate(
+            model,
+            Dopri5(),
+            ts[0],
+            ts[-1],
+            ts,
+            history_fn,
+            func_args=None,
+            dt0=ts[1] - ts[0],
+            stepsize_controller=AdaptiveStepSizeController(1e-6, 1e-9),
+            delays=model.delays,
+        )
+
+    # 변수 수 계산
+    num_variables = ys.shape[2]
+    
+    # 시각화 1: 모든 변수들의 개별 subplot
+    fig1, axes = plt.subplots(2, 4, figsize=(20, 10))
+    axes = axes.flatten()
+    
+    for i in range(num_variables):
+        ax = axes[i]
+        ax.plot(ts.cpu(), ys_pred[0, :, i].cpu(), '--', c='red', label='NDDE Prediction', linewidth=2)
+        ax.plot(ts.cpu(), test_data[0, :, i].cpu(), '-', c='blue', label='Ground Truth', linewidth=2)
+        ax.set_xlabel('Time t')
+        ax.set_ylabel(f'X_{i+1}(t)')
+        ax.set_title(f'Variable X_{i+1}: Prediction vs Ground Truth')
+        ax.legend()
+        ax.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('lorenz96_ndde_all_variables.png', dpi=300, bbox_inches='tight')
     plt.show()
-    '''
-    # 모델 및 데이터 경로 설정
-    model_path = os.path.join(os.getcwd(), "interaction_models", "subgrid_nn.pth")
-    data_dir = os.path.join(os.getcwd(), "simulated_data")
-    
-    # 랜덤하게 1개의 배치 선택
-    batch_indices = np.random.choice(range(1, 301), size=1, replace=False)[0]
-    batch_indices = 257
-    save_path = os.path.join(os.getcwd(), f"interaction_coupling_comparison_{batch_indices}.png")
-        # 커플링 항 비교 및 시각화
-    compare_coupling_terms(model_path, data_dir, batch_indices=[batch_indices], time_steps=2000, save_path=save_path)
 
-    # 10 MTU 단위로 Slow variable 예측 후 차이 시각화
-    save_path = os.path.join(os.getcwd(), f"interaction_hovmoller_diagram_{batch_indices}.png")
+    # 시각화 2: 학습 결과 요약
+    fig2, axes = plt.subplots(2, 2, figsize=(15, 10))
     
-    print(batch_indices)
-    # Hovmöller 다이어그램 생성
-    plot_hovmoller_diagram(model_path, data_dir, batch_idx=batch_indices, save_path=save_path)
-    
+    # 1. 손실 곡선
+    axes[0, 0].plot(losses)
+    axes[0, 0].set_yscale('log')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_title('Training Loss')
+    axes[0, 0].grid(True)
+
+    # 2. 예측 오차
+    error = (ys_pred[0] - test_data[0]).abs().mean(dim=1)
+    axes[0, 1].plot(ts.cpu(), error.cpu())
+    axes[0, 1].set_xlabel('Time t')
+    axes[0, 1].set_ylabel('Mean Absolute Error')
+    axes[0, 1].set_title('Prediction Error over Time')
+    axes[0, 1].grid(True)
+
+    # 3. RMSE by Variable
+    mse = torch.mean((ys_pred[0] - test_data[0]) ** 2, dim=0)
+    rmse = torch.sqrt(mse)
+    axes[1, 0].bar(range(1, len(rmse) + 1), rmse.cpu())
+    axes[1, 0].set_xlabel('Variable Index')
+    axes[1, 0].set_ylabel('RMSE')
+    axes[1, 0].set_title('RMSE by Variable')
+    axes[1, 0].grid(True)
+
+    # 4. 모든 변수 비교 (하나의 그래프에)
+    for i in range(num_variables):
+        axes[1, 1].plot(ts.cpu(), ys_pred[0, :, i].cpu(), '--', linewidth=1, alpha=0.7, label=f'Pred X_{i+1}')
+        axes[1, 1].plot(ts.cpu(), test_data[0, :, i].cpu(), '-', linewidth=1, alpha=0.7, label=f'True X_{i+1}')
+    axes[1, 1].set_xlabel('Time t')
+    axes[1, 1].set_ylabel('X(t)')
+    axes[1, 1].set_title('All Variables Comparison')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig('lorenz96_ndde_training_summary.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+    # 성능 지표 출력
+    print(f"\n[+] 최종 성능 지표:")
+    print(f"  - 전체 RMSE: {torch.sqrt(torch.mean((ys_pred[0] - test_data[0]) ** 2)):.6f}")
+
+    for i in range(len(rmse)):
+        print(f"  - 변수 {i+1} RMSE: {rmse[i]:.6f}")
+
+
+# ===========================
+# 6. 전체 실행
+# ===========================
+if __name__ == "__main__":
+    # -------------------------------
+    # ⚙️ 설정
+    # -------------------------------
+    data_dir = os.path.join(os.getcwd(), "simulated_data")  # 데이터 경로
+    hidden_dim = 128
+    epochs = 100
+    device = "cpu"
+    dropout_rate = 0.1
+    sequence_length = 200  # 각 sequence의 길이
+    num_sequences_per_traj = 3  # 각 trajectory에서 추출할 sequence 개수
+    use_real_time = False  # 실제 시간 데이터 사용 여부 (True: 실제 시간, False: 균등 간격)
+
+    # -------------------------------
+    # 📂 데이터 로딩
+    # -------------------------------
+    data_list = load_l96_data(data_dir)
+
+    # -------------------------------
+    # 📂 메타데이터 로딩
+    # -------------------------------
+    try:
+        # 메타데이터 로딩
+        with open(os.path.join(data_dir, "metadata.json"), "r") as f:
+            metadata = json.load(f)
+
+        # 시스템 파라미터 추출
+        K = metadata['K']
+        J = metadata['J']
+        F = metadata['F']
+        h = metadata['h']
+        b = metadata['b']
+        c = metadata['c']
+        dt = metadata['dt']
+
+        print(f"[+] 메타데이터 로딩 완료:")
+        print(f"  - K (X 변수 수): {K}")
+        print(f"  - J (Y 변수 수): {J}")
+        print(f"  - F (강제 항): {F}")
+        print(f"  - h (결합 강도): {h}")
+        print(f"  - b (Y 스케일링): {b}")
+        print(f"  - c (Y 시간 스케일): {c}")
+        print(f"  - dt (시간 간격): {dt}")
+
+    except Exception as e:
+        print(f"오류: 메타데이터 로딩 실패: {e}")
+        exit(1)
+
+    # -------------------------------
+    # 🔄 데이터 전처리
+    # -------------------------------
+    try:
+        print(f"[+] 데이터 전처리 시작...")
+
+        # Neural DDE용 데이터 전처리
+        ts, ys = preprocess_trajectories_for_ndde(
+            data_list,
+            sequence_length=sequence_length,
+            num_sequences_per_traj=num_sequences_per_traj,
+            dt=dt,
+            seed=42,
+            use_real_time=use_real_time
+        )
+
+        # 데이터셋 생성
+        dataset = Lorenz96Dataset(ys)
+        dataset.ts = ts  # 시간 구간을 데이터셋에 추가
+
+        print(f"[+] 데이터셋 생성 완료:")
+        print(f"  - 데이터셋 크기: {len(dataset)}")
+        print(f"  - 데이터 형태: {ys.shape}")
+
+    except Exception as e:
+        print(f"오류: 데이터 전처리 실패: {e}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
+
+    # -------------------------------
+    # ⏰ 지연 시간 파라미터 생성
+    # -------------------------------
+    try:
+        # 고정된 지연 시간 생성
+        delays = create_fixed_delays(
+            dt=dt,
+            num_delays=5
+        )
+
+    except Exception as e:
+        print(f"오류: 지연 시간 생성 실패: {e}")
+        exit(1)
+
+    # -------------------------------
+    # 🧠 NDDE 모델 학습
+    # -------------------------------
+    try:
+        print(f"[+] 설정:")
+        print(f"  - 데이터 디렉토리: {data_dir}")
+        print(f"  - 은닉층 차원: {hidden_dim}")
+        print(f"  - 학습 에포크: {epochs}")
+        print(f"  - 디바이스: {device}")
+        print(f"  - Dropout 비율: {dropout_rate}")
+        print(f"  - Sequence 길이: {sequence_length}")
+        print(f"  - Trajectory당 sequence 수: {num_sequences_per_traj}")
+        print(f"  - 실제 시간 사용: {use_real_time}")
+
+        # Lorenz96NDDE 학습
+        ts, ys, model, losses, delays_evol = train_lorenz96_ndde(
+            metadata=metadata,
+            dataset=dataset,
+            delays=delays,
+            batch_size=512,    # 작은 배치 크기
+            lr=0.001,
+            max_epoch=epochs,
+            width_size=hidden_dim,
+            depth=3,
+            seed=42,
+            plot=True,
+            print_every=2,
+            device=device
+        )
+
+        print(f"[+] NDDE 학습 완료!")
+        print(f"  - 최종 손실: {losses[-1]:.6f}")
+        print(f"  - 고정 지연 시간: {delays.tolist()}")
+
+        # 모델 저장
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'metadata': metadata,
+            'losses': losses,
+            'delays_evol': delays_evol,
+            'final_delays': delays.tolist()
+        }, 'lorenz96_ndde_model.pth')
+        print(f"[+] 모델이 lorenz96_ndde_model.pth에 저장되었습니다.")
+
+    except Exception as e:
+        print(f"오류: NDDE 학습 실패: {e}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
