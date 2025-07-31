@@ -279,6 +279,123 @@ def s(k, K):
     return 2 * k / K - 1
 
 
+def validate_simulation_data(X_forecast, Y_forecast=None, t_forecast=None, C_forecast=None, ic_num=None, system_type='coupled'):
+    """
+    시뮬레이션 데이터의 품질을 검증하는 함수
+
+    Args:
+        X_forecast: X 변수 예측 데이터
+        Y_forecast: Y 변수 예측 데이터 (coupled system에서만 사용)
+        t_forecast: 시간 데이터
+        C_forecast: Coupling 데이터 (coupled system에서만 사용)
+        ic_num: 초기 조건 번호
+        system_type: 'coupled' 또는 'single'
+
+    Returns:
+        bool: 검증 통과 여부
+    """
+    if system_type == 'coupled':
+        # 1. NaN/Inf 검증
+        if (np.any(np.isnan(X_forecast)) or np.any(np.isnan(Y_forecast)) or
+            np.any(np.isnan(t_forecast)) or np.any(np.isnan(C_forecast))):
+            return False
+
+        if (np.any(np.isinf(X_forecast)) or np.any(np.isinf(Y_forecast)) or
+            np.any(np.isinf(t_forecast)) or np.any(np.isinf(C_forecast))):
+            return False
+
+        # 2. 극단적인 값 검증 (발산 감지)
+        x_max_abs = np.max(np.abs(X_forecast))
+        y_max_abs = np.max(np.abs(Y_forecast))
+        c_max_abs = np.max(np.abs(C_forecast))
+
+        if x_max_abs > 1000:
+            return False
+
+        if y_max_abs > 1000:
+            return False
+
+        if c_max_abs > 1000:
+            return False
+
+        # 3. 데이터 범위 검증 (물리적으로 의미있는 범위)
+        x_range = np.max(X_forecast) - np.min(X_forecast)
+        y_range = np.max(Y_forecast) - np.min(Y_forecast)
+
+        if x_range < 0.1:  # X 변수가 거의 변화하지 않음
+            return False
+
+        if y_range < 0.01:  # Y 변수가 거의 변화하지 않음
+            return False
+
+        # 4. 시간 데이터 검증
+        if len(t_forecast) < 100:  # 최소 시간 스텝 수 확인
+            return False
+
+        # 5. 데이터 일관성 검증
+        if (X_forecast.shape[0] != Y_forecast.shape[0] or
+            X_forecast.shape[0] != t_forecast.shape[0] or
+            X_forecast.shape[0] != C_forecast.shape[0]):
+            return False
+
+        # 6. 통계적 검증 (이상치 감지)
+        x_std = np.std(X_forecast)
+        y_std = np.std(Y_forecast)
+
+        if x_std < 0.01:  # X 변수의 표준편차가 너무 작음
+            return False
+
+        if y_std < 0.001:  # Y 변수의 표준편차가 너무 작음
+            return False
+
+        print(f"IC {ic_num}: 검증 통과 ✓ (X_max: {x_max_abs:.2f}, Y_max: {y_max_abs:.2f}, C_max: {c_max_abs:.2f})")
+        return True
+
+    else:  # single system
+        # 1. NaN/Inf 검증
+        if np.any(np.isnan(X_forecast)) or np.any(np.isnan(t_forecast)):
+            print(f"IC {ic_num}: NaN 값이 발견되어 검증 실패")
+            return False
+
+        if np.any(np.isinf(X_forecast)) or np.any(np.isinf(t_forecast)):
+            print(f"IC {ic_num}: Inf 값이 발견되어 검증 실패")
+            return False
+
+        # 2. 극단적인 값 검증 (발산 감지)
+        x_max_abs = np.max(np.abs(X_forecast))
+
+        if x_max_abs > 1000:
+            print(f"IC {ic_num}: X 변수가 발산 (최대 절댓값: {x_max_abs:.2f})")
+            return False
+
+        # 3. 데이터 범위 검증 (물리적으로 의미있는 범위)
+        x_range = np.max(X_forecast) - np.min(X_forecast)
+
+        if x_range < 0.1:  # X 변수가 거의 변화하지 않음
+            print(f"IC {ic_num}: X 변수의 변화가 너무 작음 (범위: {x_range:.6f})")
+            return False
+
+        # 4. 시간 데이터 검증
+        if len(t_forecast) < 100:  # 최소 시간 스텝 수 확인
+            print(f"IC {ic_num}: 시간 스텝이 너무 적음 ({len(t_forecast)})")
+            return False
+
+        # 5. 데이터 일관성 검증
+        if X_forecast.shape[0] != t_forecast.shape[0]:
+            print(f"IC {ic_num}: 데이터 차원이 일치하지 않음")
+            return False
+
+        # 6. 통계적 검증 (이상치 감지)
+        x_std = np.std(X_forecast)
+
+        if x_std < 0.01:  # X 변수의 표준편차가 너무 작음
+            print(f"IC {ic_num}: X 변수의 표준편차가 너무 작음 ({x_std:.6f})")
+            return False
+
+        print(f"IC {ic_num}: 검증 통과 ✓ (X_max: {x_max_abs:.2f})")
+        return True
+
+
 # Class for convenience
 class L96s:
     """
@@ -484,14 +601,13 @@ class L96:
             dt=self.dt,
         )
         if store:
-            print(f"\nt : {self.t, t[-1]}")
             self.X, self.Y, self.t = X[-1], Y[-1], t[-1]
         if return_coupling:
             return X, Y, t, C
         else:
             return X, Y, t
 
-    
+
 if __name__ == "__main__":
     K = 8 # Number of globa-scale variables X
     J = 32 # Number of local-scale Y variables per single global-scale X variable
@@ -503,13 +619,13 @@ if __name__ == "__main__":
 
     si = 0.005  # Sampling time interval
     dt = 0.005  # Time step
-    
+
     print("\n=== Running Main Experiment ===")
 
     num_ic = 300  # 초기 조건 개수
     ic_interval = 10  # 적분의 마지막 포인트 이후 다음 적분을 시작할 초기 조건까지의 간격 (MTU)
     forecast_time = 10  # # Hist_Deterministic.py의 nt = 각 초기 조건 별 적분 기간 (MTU) (10 / 0.005 = 20000)
-    
+
     # 데이터 저장을 위한 배열 초기화
     # 메모리 효율성을 위해 결과를 점진적으로 저장
     time_steps_per_ic = int(forecast_time / si) + 1
@@ -517,13 +633,8 @@ if __name__ == "__main__":
     all_Y = np.zeros((num_ic, time_steps_per_ic, J * K))
     all_t = np.zeros((num_ic, time_steps_per_ic))
     all_C = np.zeros((num_ic, time_steps_per_ic, K))
-    
-    ic_X = np.zeros((num_ic, K))
-    ic_Y = np.zeros((num_ic, J * K))
 
-    spinup_X = np.zeros((num_ic, K))
-    spinup_Y = np.zeros((num_ic, J * K))
-    
+
     import time
     start_time = time.time()
     k = np.arange(K)
@@ -533,60 +644,108 @@ if __name__ == "__main__":
     Yinit = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
 
     # 모델 초기화
-    model = L96(K, J, F=F, h=h, b=b, c=c, dt=dt)
-    model.set_state(Xinit, Yinit)    
+    coupled_system = L96(K, J, F=F, h=h, b=b, c=c, dt=dt)
+    coupled_system.set_state(Xinit, Yinit)
     spinup_time = 3 # Hist_Deterministic.py의 nt_pre = (10 / 0.005 = 2000)
-    
-    for i in tqdm(range(num_ic), desc="초기 조건 처리 중"):
-        # 초기 조건 저장        
-        ic_X[i] = model.X
-        ic_Y[i] = model.Y
-
+    count_ic = 0
+    while count_ic < num_ic:
         # 3 MTU 동안 스핀업 실행 및 spinup 상태 저장
-        X_spinup, Y_spinup, t_spinup, C_spinup = model.run(si, spinup_time, store=True, return_coupling=True)
-        spinup_X[i] = model.X
-        spinup_Y[i] = model.Y
-        
-        # t = 0으로 초기화 한 후, 10 MTU 동안 적분 후 마지막 상태 저장
-        X_forecast, Y_forecast, t_forecast, C_forecast = model.run(si, forecast_time, store=True, return_coupling=True)
-        print(f"X_forecast: {X_forecast.shape}, Y_forecast: {Y_forecast.shape}, t_forecast: {t_forecast.shape}, C_forecast: {C_forecast.shape}")
+        X_spinup, Y_spinup, t_spinup, C_spinup = coupled_system.run(si, spinup_time, store=True, return_coupling=True)
+        # 이후 10 MTU 동안 적분 후 마지막 상태 저장
+        X_forecast, Y_forecast, t_forecast, C_forecast = coupled_system.run(si, forecast_time, store=True, return_coupling=True)
+        # 데이터 검증 수행
+        if not validate_simulation_data(X_forecast, Y_forecast, t_forecast, C_forecast, count_ic + 1, system_type='coupled'):
+            coupled_system.randomize_IC()
+            continue
+
+        # 검증 통과 시 데이터 저장
+        print(f"IC {count_ic + 1}: 검증 통과, Coupling System 데이터 저장 중...")
+
         # 적분 결과 저장
-        all_X[i] = X_forecast
-        all_Y[i] = Y_forecast
-        all_t[i] = t_forecast
-        all_C[i] = C_forecast
+        all_X[count_ic] = X_forecast
+        all_Y[count_ic] = Y_forecast
+        all_t[count_ic] = t_forecast
+        all_C[count_ic] = C_forecast
+        count_ic += 1
+        coupled_system.randomize_IC()
 
-        # 초기화
-        model.randomize_IC()
 
-    print("\n모든 초기 조건 처리 완료!")
-
-    # 실행 시간 측정
     end_time = time.time()
     elapsed_time = end_time - start_time
-    print(f"\n모든 초기 조건 처리 완료! 소요 시간: {elapsed_time:.2f}초")
+    print(f"\n모든 Coupling System 초기 조건 처리 완료! 소요 시간: {elapsed_time:.2f}초")
 
-
+    # 데이터를 50개 초기 조건씩 분할하여 저장
     results_dir = os.path.join(os.getcwd(), "simulated_data")
     os.makedirs(results_dir, exist_ok=True)
 
-    # 데이터를 50개 초기 조건씩 분할하여 저장
     batch_size = 1
     num_batches = (num_ic + batch_size - 1) // batch_size  # 올림 나눗셈
 
-    for batch in tqdm(range(num_batches), desc="데이터 저장 중"):
+    print(f"\n총 {num_ic}개의 검증된 데이터를 {num_batches}개 배치로 저장합니다...")
+
+    for batch in tqdm(range(num_batches), desc="Coupling System 데이터 저장 중"):
         start_idx = batch * batch_size
         end_idx = min((batch + 1) * batch_size, num_ic)
-        
+
+        batch_X = all_X[start_idx:end_idx]
+        batch_Y = all_Y[start_idx:end_idx]
+        batch_t = all_t[start_idx:end_idx]
+        batch_C = all_C[start_idx:end_idx]
+
+        np.save(f"{results_dir}/X_batch_coupled_{batch+1}.npy", batch_X)
+        np.save(f"{results_dir}/Y_batch_coupled_{batch+1}.npy", batch_Y)
+        np.save(f"{results_dir}/t_batch_coupled_{batch+1}.npy", batch_t)
+        np.save(f"{results_dir}/C_batch_coupled_{batch+1}.npy", batch_C)
+
+
+
+    print(f"\n총 {num_ic}개의 검증된 single system 데이터 생성 시작...")
+
+    start_time = time.time()
+    single_system = L96s(K, dt, F=F, method=RK4)
+    single_system.set_state(Xinit)
+    all_X_single = np.zeros((num_ic, time_steps_per_ic, K))
+    all_t_single = np.zeros((num_ic, time_steps_per_ic))
+
+    count_ic = 0
+    while count_ic < num_ic:
+        # 3 MTU 동안 스핀업 실행 및 spinup 상태 저장
+        X_spinup_single, t_spinup_single = single_system.run(spinup_time, store=True)
+        # 이후 10 MTU 동안 적분 후 마지막 상태 저장
+        X_forecast_single, t_forecast_single = single_system.run(forecast_time, store=True)
+        # 데이터 검증 수행
+        if not validate_simulation_data(X_forecast_single, t_forecast=t_forecast_single, ic_num=count_ic + 1, system_type='single'):
+            single_system.randomize_IC()
+            continue
+
+        # 검증 통과 시 데이터 저장
+        print(f"IC {count_ic + 1}: 검증 통과, Single System 데이터 저장 중...")
+
+        all_X_single[count_ic] = X_forecast_single
+        all_t_single[count_ic] = t_forecast_single
+        count_ic += 1
+        single_system.randomize_IC()
+
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"\n모든 Single System 초기 조건 처리 완료! 소요 시간: {elapsed_time:.2f}초")
+
+    # Single System 데이터 저장
+    print(f"\n총 {num_ic}개의 검증된 Single System 데이터를 {num_batches}개 배치로 저장합니다...")
+
+    for batch in tqdm(range(num_batches), desc="Single System 데이터 저장 중"):
+        start_idx = batch * batch_size
+        end_idx = min((batch + 1) * batch_size, num_ic)
+
+        # 저장 전 최종 검증
+        batch_X_single = all_X_single[start_idx:end_idx]
+        batch_t_single = all_t_single[start_idx:end_idx]
+
         # 각 배치의 데이터 저장
-        np.save(f"{results_dir}/X_batch_{batch+1}.npy", all_X[start_idx:end_idx])
-        np.save(f"{results_dir}/Y_batch_{batch+1}.npy", all_Y[start_idx:end_idx])
-        np.save(f"{results_dir}/t_batch_{batch+1}.npy", all_t[start_idx:end_idx])
-        np.save(f"{results_dir}/C_batch_{batch+1}.npy", all_C[start_idx:end_idx])
-    # 초기 조건 저장
-    np.save(f"{results_dir}/ic_X.npy", ic_X)
-    np.save(f"{results_dir}/ic_Y.npy", ic_Y)
-    
+        np.save(f"{results_dir}/X_batch_single_{batch+1}.npy", batch_X_single)
+        np.save(f"{results_dir}/t_batch_single_{batch+1}.npy", batch_t_single)
+
+
     # 메타데이터 저장
     metadata = {
         'K': K,
@@ -609,5 +768,8 @@ if __name__ == "__main__":
     with open(f"{results_dir}/metadata.json", "w") as f:
         json.dump(metadata, f)
 
-    print(f"\n데이터가 {results_dir} 디렉토리에 저장되었습니다.")
-    print(f"총 {num_batches}개의 배치로 나누어 저장되었습니다.")
+    print(f"\n=== 데이터 생성 및 저장 완료 ===")
+    print(f"저장 위치: {results_dir}")
+    print(f"총 {num_ic}개의 검증된 초기 조건")
+    print(f"총 {num_batches}개의 배치 파일")
+    print(f"모든 데이터가 품질 검증을 통과하여 저장되었습니다. ✓")
