@@ -1,5 +1,9 @@
 import os
 import sys
+
+# OpenMP 중복 라이브러리 로드 문제 해결
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 import json
 import time
 import random
@@ -148,152 +152,6 @@ class dAMZ(nn.Module):
         }
 
 
-class ChaoticSystem:
-    """
-    Chaotic System 클래스 - Eq. (29)를 구현한 카오스 시스템
-    """
-
-    def __init__(self, dt = 0.02, N_T = 100, memory_length_TM = 1.2, eps=0.01, selection_mode = 'random'):
-        """
-        ChaoticSystem 초기화
-
-        Args:
-            eps (float): 시스템 파라미터 (기본값: 0.01)
-        """
-        self.eps = eps
-
-        # 초기 조건 범위 설정 - 더 안정적인 영역으로 조정
-        self.x1_range = (-5, 8)      # 기존: (-7.5, 10)
-        self.x2_range = (-8, 5)      # 기존: (-10, 7.5)
-        self.x3_range = (0, 15)      # 기존: (0, 18)
-        self.y_range = (0, 50)       # 기존: (-1, 100)
-
-        self.trajectory_num_NT = N_T  # trajectory 개수
-        self.sequence_length_Ki = []
-        self.dt = dt
-        self.memory_length_TM = memory_length_TM
-
-        self.selection_mode = selection_mode
-        self.memory_range_NM = int(self.memory_length_TM / self.dt)
-        self.sequence_length = self.memory_range_NM + 2
-
-    def system_equations(self, t, x):
-        """
-        Eq. (29) 정의 - 카오스 시스템의 미분 방정식
-
-        Args:
-            t (float): 시간
-            x (list): 상태 변수 [x1, x2, x3, y]
-
-        Returns:
-            list: 미분값 [dx1, dx2, dx3, dy]
-        """
-        x1, x2, x3, y = x
-        dx1 = -x2 - x3
-        dx2 = x1 + (1/5) * x2
-        dx3 = 1/5 + y - 5 * x3
-        dy = (-y + x1 * x2) / self.eps
-
-
-        return [dx1, dx2, dx3, dy]
-
-    def set_parameter_ranges(self, x1_range=None, x2_range=None, x3_range=None, y_range=None):
-        """
-        초기 조건 범위 설정
-
-        Args:
-            x1_range (tuple): x1 범위
-            x2_range (tuple): x2 범위
-            x3_range (tuple): x3 범위
-            y_range (tuple): y 범위
-        """
-        if x1_range is not None:
-            self.x1_range = x1_range
-        if x2_range is not None:
-            self.x2_range = x2_range
-        if x3_range is not None:
-            self.x3_range = x3_range
-        if y_range is not None:
-            self.y_range = y_range
-
-    def get_system_info(self):
-        """
-        시스템 정보 반환
-
-        Returns:
-            dict: 시스템 파라미터 정보
-        """
-        return {
-            'eps': self.eps,
-            'x1_range': self.x1_range,
-            'x2_range': self.x2_range,
-            'x3_range': self.x3_range,
-            'y_range': self.y_range
-        }
-
-    def sample_initial_conditions(self, N):
-        """
-        초기 조건 범위에서 샘플링
-
-        Args:
-            N (int): 샘플 개수
-
-        Returns:
-            np.ndarray: 초기 조건들 (N, 4)
-        """
-        x1 = np.random.uniform(self.x1_range[0], self.x1_range[1], N)
-        x2 = np.random.uniform(self.x2_range[0], self.x2_range[1], N)
-        x3 = np.random.uniform(self.x3_range[0], self.x3_range[1], N)
-        y = np.random.uniform(self.y_range[0], self.y_range[1], N)
-        return np.stack([x1, x2, x3, y], axis=1)
-
-    def generate_single_trajectory(self, x0, K=100, delta=0.02):
-        """
-        단일 trajectory 생성기
-
-        Args:
-            x0 (np.ndarray): 초기 조건
-            K (int): 시간 스텝 수
-            delta (float): 시간 간격
-
-        Returns:
-            np.ndarray: trajectory (K+1, 3) - x1, x2, x3만 포함
-        """
-        t_span = (0, K * delta)
-        t_eval = np.linspace(t_span[0], t_span[1], K + 1)
-        sol = solve_ivp(
-            fun=self.system_equations,
-            t_span=t_span,
-            y0=x0,
-            t_eval=t_eval,
-            method='RK45',
-            rtol=1e-9,
-            atol=1e-11
-        )
-        z_traj = sol.y[:3, :].T  # x1, x2, x3만 추출
-
-        return z_traj
-
-    def generate_trajectories(self, K=100, delta=0.02, seed=42):
-        """
-        전체 trajectory 생성기
-
-        Args:
-            N_T (int): trajectory 개수
-            K (int): 시간 스텝 수
-            delta (float): 시간 간격
-            seed (int): 랜덤 시드
-
-        Returns:
-            list: trajectory들의 리스트
-        """
-        np.random.seed(seed)
-        x0_list = self.sample_initial_conditions(self.trajectory_num_NT)
-        all_trajectories = [self.generate_single_trajectory(x0, K, delta) for x0 in x0_list]
-        all_trajectories = list(filter(lambda x: len(x) >= self.sequence_length, all_trajectories))
-
-        return all_trajectories
-
 def create_training_dataset(all_trajectories, memory_range_NM, selection_mode='random', J0=5):
     if selection_mode == 'random':
         return create_random_training_dataset(all_trajectories, memory_range_NM, J0)
@@ -301,6 +159,7 @@ def create_training_dataset(all_trajectories, memory_range_NM, selection_mode='r
         return create_deterministic_training_dataset(all_trajectories, memory_range_NM)
     else:
         raise ValueError(f"Invalid selection mode: {selection_mode}")
+
 
 def create_random_training_dataset(all_trajectories, memory_range_NM, J0=5):
     Z_list, z_list = [], []
@@ -324,6 +183,7 @@ def create_random_training_dataset(all_trajectories, memory_range_NM, J0=5):
     print(f"[Random] Z.shape = {Z.shape}, z.shape = {z.shape}")
     return Z, z
 
+
 def create_deterministic_training_dataset(all_trajectories, memory_range_NM):
     Z_list, z_list = [], []
     input_len = memory_range_NM + 1
@@ -343,6 +203,7 @@ def create_deterministic_training_dataset(all_trajectories, memory_range_NM):
     z = np.array(z_list)
     print(f"[Deterministic] Z.shape = {Z.shape}, z.shape = {z.shape}")
     return Z, z
+
 
 def normalize_data(Z, z):
     """
@@ -374,6 +235,7 @@ def normalize_data(Z, z):
     print(f"타겟 데이터 통계: mean={z_mean.mean():.4f}, std={z_std.mean():.4f}")
     
     return Z_norm, z_norm, Z_mean, Z_std, z_mean, z_std
+
 
 def train_model(model, Z, z, epochs=2000, lr=1e-3, batch_size=32, normalize=True, clip_grad_norm=1.0):
     """
@@ -478,102 +340,6 @@ def train_model(model, Z, z, epochs=2000, lr=1e-3, batch_size=32, normalize=True
     return losses
 
 
-def simulate_and_plot_x1_prediction(model, chaotic_system, t_end=400, t_start_plot=200, delta=0.02):
-    """
-    모델 예측과 실제 시뮬레이션을 비교하여 x1을 시각화하는 함수
-
-    Args:
-        model: 학습된 dAMZ 모델
-        chaotic_system: ChaoticSystem 인스턴스
-        t_end: 적분 끝 시간
-        t_start_plot: 시각화 시작 시간
-        delta: 시간 간격
-    """
-    # 초기 조건 설정
-    initial_condition = chaotic_system.sample_initial_conditions(1)[0]
-    print(f"초기 조건: {initial_condition}")
-
-    # 실제 시뮬레이션
-    t_eval = np.arange(0, t_end + delta, delta)
-    t_span = (0, t_end)
-
-    try:
-        sol = solve_ivp(
-            fun=chaotic_system.system_equations,
-            t_span=t_span,
-            y0=initial_condition,
-            t_eval=t_eval,
-            method='RK45',
-            rtol=1e-9,
-            atol=1e-11
-        )
-
-        t_vals = sol.t
-        x1_true = sol.y[0, :]  # 실제 x1 값
-
-        print(f"시뮬레이션 완료: {len(t_vals)} 시간 스텝")
-        print(f"x1 범위: [{x1_true.min():.3f}, {x1_true.max():.3f}]")
-
-        # 시스템 발산 감지
-        if np.any(np.abs(x1_true) > 1000) or len(t_vals) < t_end / delta * 0.5:
-            print("경고: 시스템이 발산했습니다. 이 초기 조건은 건너뜁니다.")
-            return
-
-        # 모델 예측
-        model.eval()
-        n_M = chaotic_system.memory_range_NM
-
-        # 메모리 항목들을 포함한 입력 데이터 준비
-        z_traj = sol.y[:3, :].T  # x1, x2, x3만 추출
-
-        x1_pred = []
-        with torch.no_grad():
-            for i in range(n_M + 1, len(z_traj)):
-                # Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
-                Z_input = z_traj[i-n_M-1:i].reshape(-1)  # [D]
-                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)  # [1, D]
-
-                # 예측
-                z_pred = model(Z_tensor)
-                x1_pred.append(z_pred[0, 0].item())  # x1 예측값
-
-        print(f"예측 완료: {len(x1_pred)} 개의 예측값")
-
-        # 시각화
-        t_pred = t_vals[n_M + 1:]
-        mask = (t_pred >= t_start_plot)
-        t_plot = t_pred[mask]
-        x1_true_plot = x1_true[n_M + 1:][mask]
-        x1_pred_plot = np.array(x1_pred)[mask]
-
-        print(f"필터링 후 데이터: {len(t_plot)} 개의 시간 포인트")
-        print(f"t_plot 범위: [{t_plot.min():.3f}, {t_plot.max():.3f}]")
-
-        if len(t_plot) == 0:
-            print("경고: 필터링 후 데이터가 없습니다!")
-            print(f"t_start_plot={t_start_plot}, t_pred 범위=[{t_pred.min():.3f}, {t_pred.max():.3f}]")
-            return
-
-        plt.figure(figsize=(12, 6))
-        plt.plot(t_plot, x1_true_plot, 'b-', label='True $x_1(t)$', linewidth=2)
-        plt.plot(t_plot, x1_pred_plot, 'r--', label='Pred $x_1(t)$', linewidth=2)
-        plt.xlabel('time t')
-        plt.ylabel('$x_1(t)$')
-        plt.title(f'dAMZ prediction vs real simulation [{t_start_plot}, {t_end}]')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-        # MSE 계산
-        mse = np.mean((x1_true_plot - x1_pred_plot) ** 2)
-        print(f'예측 MSE: {mse:.6f}')
-
-    except Exception as e:
-        print(f"시뮬레이션 중 오류 발생: {e}")
-        print(f"초기 조건 {initial_condition}에서 시스템이 불안정할 수 있습니다.")
-
-
 def lorenz96_system_equations(t, state, F, h, b, c, K, J):
     """
     Lorenz 96 two-time-scale 시스템의 미분 방정식
@@ -606,7 +372,7 @@ def lorenz96_system_equations(t, state, F, h, b, c, K, J):
     return np.concatenate([dX, dY])
 
 
-def simulate_and_plot_lorenz96_x1_prediction(model, metadata, t_end=10, t_start_plot=2, delta=0.005):
+def simulate_and_plot_lorenz96_x1_prediction(model, metadata, X_init, Y_init, t_end=10, t_start_plot=2, delta=0.005):
     """
     Lorenz 96 시스템의 첫 번째 변수(X1)에 대한 모델 예측과 실제 시뮬레이션을 비교하여 시각화하는 함수
 
@@ -634,10 +400,11 @@ def simulate_and_plot_lorenz96_x1_prediction(model, metadata, t_end=10, t_start_
     def s(k, K):
         return 2 * np.pi * k / K
     
-    X_init = s(k, K) * (s(k, K) - 1) * (s(k, K) + 1)
-    Y_init = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
-    
+    if X_init is None or Y_init is None:
+        X_init = s(k, K) * (s(k, K) - 1) * (s(k, K) + 1)
+        Y_init = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
     initial_condition = np.concatenate([X_init, Y_init])
+
     print(f"초기 조건 X: {X_init}")
     print(f"초기 조건 Y: {Y_init[:J]} (첫 번째 그룹만 표시)")
 
@@ -682,7 +449,7 @@ def simulate_and_plot_lorenz96_x1_prediction(model, metadata, t_end=10, t_start_
                 Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)  # [1, D]
 
                 # 예측
-                z_pred = model(Z_tensor)
+                z_pred = model(Z_tensor, enable_dropout=False)
                 x1_pred.append(z_pred[0, 0].item())  # X1 예측값
 
         print(f"예측 완료: {len(x1_pred)} 개의 예측값")
@@ -723,6 +490,406 @@ def simulate_and_plot_lorenz96_x1_prediction(model, metadata, t_end=10, t_start_
         data_range = x1_true_plot.max() - x1_true_plot.min()
         relative_error = rmse / data_range * 100
         print(f'상대적 오차: {relative_error:.2f}%')
+
+    except Exception as e:
+        print(f"시뮬레이션 중 오류 발생: {e}")
+        print(f"초기 조건에서 시스템이 불안정할 수 있습니다.")
+
+
+def simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, X_init, Y_init, t_end=10, t_start_plot=2, delta=0.005):
+    """
+    Lorenz 96 시스템의 모든 X 변수에 대한 모델 예측과 실제 시뮬레이션을 비교하여 시각화하는 함수
+
+    Args:
+        model: 학습된 dAMZ 모델
+        metadata: Lorenz 96 시스템의 메타데이터
+        t_end: 적분 끝 시간
+        t_start_plot: 시각화 시작 시간
+        delta: 시간 간격
+    """
+    # 시스템 파라미터 추출
+    K = metadata['K']
+    J = metadata['J']
+    F = metadata['F']
+    h = metadata['h']
+    b = metadata['b']
+    c = metadata['c']
+    dt = metadata['dt']
+    
+    # 초기 조건 설정
+    k = np.arange(K)
+    j = np.arange(J * K)
+    # 초기 조건 함수 (multiscale_lorenz.py에서 가져옴)
+    def s(k, K):
+        return 2 * np.pi * k / K
+
+    if X_init is None or Y_init is None:
+        X_init = s(k, K) * (s(k, K) - 1) * (s(k, K) + 1)
+        Y_init = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
+        
+    initial_condition = np.concatenate([X_init, Y_init])
+
+    # 실제 시뮬레이션
+    t_eval = np.arange(0, t_end + delta, delta)
+    t_span = (0, t_end)
+
+    try:
+        sol = solve_ivp(
+            fun=lambda t, y: lorenz96_system_equations(t, y, F, h, b, c, K, J),
+            t_span=t_span,
+            y0=initial_condition,
+            t_eval=t_eval,
+            method='RK45',
+            rtol=1e-9,
+            atol=1e-11
+        )
+
+        t_vals = sol.t
+        X_true = sol.y[:K, :].T
+
+        # 모델 예측
+        model.eval()
+        n_M = int(0.05 / dt)
+
+        X_pred = []
+        with torch.no_grad():
+            for i in range(n_M + 1, len(X_true)):
+                Z_input = X_true[i-n_M-1:i].reshape(-1)
+                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)
+                z_pred = model(Z_tensor)
+                X_pred.append(z_pred[0].numpy())
+
+        X_pred = np.array(X_pred)
+        t_pred = t_vals[n_M + 1:]
+        mask = (t_pred >= t_start_plot)
+        t_plot = t_pred[mask]
+        X_true_plot = X_true[n_M + 1:][mask]
+        X_pred_plot = X_pred[mask]
+
+        # 모든 변수 시각화
+        fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+        axes = axes.flatten()
+
+        for i in range(K):
+            ax = axes[i]
+            ax.plot(t_plot, X_true_plot[:, i], 'b-', label='True', linewidth=2)
+            ax.plot(t_plot, X_pred_plot[:, i], 'r--', label='Pred', linewidth=2)
+            ax.set_xlabel('time t')
+            ax.set_ylabel(f'$X_{i+1}(t)$')
+            ax.set_title(f'Variable {i+1}')
+            ax.legend()
+            ax.grid(True)
+
+        plt.tight_layout()
+        plt.show()
+
+        # 전체 MSE 및 RMSE 계산
+        mse_total = np.mean((X_true_plot - X_pred_plot) ** 2)
+        rmse_total = np.sqrt(mse_total)
+        print(f'전체 예측 MSE: {mse_total:.6f}')
+        print(f'전체 예측 RMSE: {rmse_total:.6f}')
+        
+        # 각 변수별 MSE 계산
+        for i in range(K):
+            mse_var = np.mean((X_true_plot[:, i] - X_pred_plot[:, i]) ** 2)
+            rmse_var = np.sqrt(mse_var)
+            print(f'변수 {i+1} MSE: {mse_var:.6f}, RMSE: {rmse_var:.6f}')
+
+    except Exception as e:
+        print(f"시뮬레이션 중 오류 발생: {e}")
+
+
+def simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, X_init, Y_init, t_end=10, t_start_plot=2, delta=0.005, num_mc_samples=100):
+    """
+    Lorenz 96 시스템의 첫 번째 변수(X1)에 대한 불확실성을 포함한 모델 예측과 실제 시뮬레이션을 비교하여 시각화하는 함수
+
+    Args:
+        model: 학습된 dAMZ 모델 (Monte Carlo Dropout 포함)
+        metadata: Lorenz 96 시스템의 메타데이터
+        t_end: 적분 끝 시간
+        t_start_plot: 시각화 시작 시간
+        delta: 시간 간격
+        num_mc_samples: Monte Carlo 샘플 수
+    """
+    # 시스템 파라미터 추출
+    K = metadata['K']
+    J = metadata['J']
+    F = metadata['F']
+    h = metadata['h']
+    b = metadata['b']
+    c = metadata['c']
+    dt = metadata['dt']
+    
+    # 초기 조건 설정 (Lorenz 96 시스템에 맞는 초기 조건)
+    k = np.arange(K)
+    j = np.arange(J * K)
+    def s(k, K):
+        return 2 * np.pi * k / K
+
+    if X_init is None or Y_init is None:
+        X_init = s(k, K) * (s(k, K) - 1) * (s(k, K) + 1)
+        Y_init = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
+    
+    initial_condition = np.concatenate([X_init, Y_init])
+    print(f"초기 조건 X: {X_init}")
+    print(f"초기 조건 Y: {Y_init[:J]} (첫 번째 그룹만 표시)")
+
+    # 실제 시뮬레이션
+    t_eval = np.arange(0, t_end + delta, delta)
+    t_span = (0, t_end)
+
+    try:
+        # Lorenz 96 시스템 적분
+        sol = solve_ivp(
+            fun=lambda t, y: lorenz96_system_equations(t, y, F, h, b, c, K, J),
+            t_span=t_span,
+            y0=initial_condition,
+            t_eval=t_eval,
+            method='RK45',
+            rtol=1e-9,
+            atol=1e-11
+        )
+
+        t_vals = sol.t
+        X_true = sol.y[:K, :].T  # X 변수들만 추출
+        x1_true = X_true[:, 0]  # 첫 번째 변수
+
+        print(f"시뮬레이션 완료: {len(t_vals)} 시간 스텝")
+        print(f"X1 범위: [{x1_true.min():.3f}, {x1_true.max():.3f}]")
+
+        # 시스템 발산 감지
+        if np.any(np.abs(x1_true) > 1000) or len(t_vals) < t_end / delta * 0.5:
+            print("경고: 시스템이 발산했습니다. 이 초기 조건은 건너뜁니다.")
+            return
+
+        # 모델 예측 (불확실성 포함)
+        n_M = int(0.05 / dt)  # 메모리 길이
+
+        # 메모리 항목들을 포함한 입력 데이터 준비
+        x1_pred_mean = []
+        x1_pred_std = []
+        
+        with torch.no_grad():
+            for i in range(n_M + 1, len(X_true)):
+                # Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
+                Z_input = X_true[i-n_M-1:i].reshape(-1)  # [D]
+                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)  # [1, D]
+
+                # Monte Carlo Dropout을 사용한 불확실성 추정
+                mean_pred, std_pred = model.predict_with_uncertainty(Z_tensor, num_samples=num_mc_samples)
+                x1_pred_mean.append(mean_pred[0, 0].item())  # X1 평균 예측값
+                x1_pred_std.append(std_pred[0, 0].item())    # X1 표준편차
+
+        print(f"예측 완료: {len(x1_pred_mean)} 개의 예측값 (Monte Carlo 샘플 수: {num_mc_samples})")
+
+        # 시각화
+        t_pred = t_vals[n_M + 1:]
+        mask = (t_pred >= t_start_plot)
+        t_plot = t_pred[mask]
+        x1_true_plot = x1_true[n_M + 1:][mask]
+        x1_pred_mean_plot = np.array(x1_pred_mean)[mask]
+        x1_pred_std_plot = np.array(x1_pred_std)[mask]
+
+        print(f"필터링 후 데이터: {len(t_plot)} 개의 시간 포인트")
+        print(f"t_plot 범위: [{t_plot.min():.3f}, {t_plot.max():.3f}]")
+
+        if len(t_plot) == 0:
+            print("경고: 필터링 후 데이터가 없습니다!")
+            print(f"t_start_plot={t_start_plot}, t_pred 범위=[{t_pred.min():.3f}, {t_pred.max():.3f}]")
+            return
+
+        # 불확실성을 포함한 시각화
+        plt.figure(figsize=(12, 8))
+        
+        # 실제 값과 평균 예측
+        plt.plot(t_plot, x1_true_plot, 'b-', label='True $X_1(t)$', linewidth=2)
+        plt.plot(t_plot, x1_pred_mean_plot, 'r--', label='Pred $X_1(t)$ (mean)', linewidth=2)
+        
+        # 불확실성 구간 (95% 신뢰구간)
+        plt.fill_between(t_plot, 
+                        x1_pred_mean_plot - 2*x1_pred_std_plot, 
+                        x1_pred_mean_plot + 2*x1_pred_std_plot, 
+                        alpha=0.1, color='red', label='95% Confidence Interval')
+        
+        # 1 표준편차 구간
+        plt.fill_between(t_plot, 
+                        x1_pred_mean_plot - x1_pred_std_plot, 
+                        x1_pred_mean_plot + x1_pred_std_plot, 
+                        alpha=0.1, color='red', label='±1σ Interval')
+        
+        plt.xlabel('time t')
+        plt.ylabel('$X_1(t)$')
+        plt.title(f'Lorenz 96 dAMZ prediction with uncertainty [{t_start_plot}, {t_end}]')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        # MSE 및 RMSE 계산 (평균 예측 기준)
+        mse = np.mean((x1_true_plot - x1_pred_mean_plot) ** 2)
+        rmse = np.sqrt(mse)
+        print(f'예측 MSE: {mse:.6f}')
+        print(f'예측 RMSE: {rmse:.6f}')
+        
+        # 데이터 범위 대비 상대적 오차
+        data_range = x1_true_plot.max() - x1_true_plot.min()
+        relative_error = rmse / data_range * 100
+        print(f'상대적 오차: {relative_error:.2f}%')
+        
+        # 불확실성 통계
+        mean_uncertainty = np.mean(x1_pred_std_plot)
+        max_uncertainty = np.max(x1_pred_std_plot)
+        print(f'평균 불확실성 (표준편차): {mean_uncertainty:.6f}')
+        print(f'최대 불확실성 (표준편차): {max_uncertainty:.6f}')
+
+    except Exception as e:
+        print(f"시뮬레이션 중 오류 발생: {e}")
+        print(f"초기 조건에서 시스템이 불안정할 수 있습니다.")
+
+
+def simulate_and_plot_lorenz96_all_variables_prediction_with_uncertainty(model, metadata, X_init, Y_init, t_end=10, t_start_plot=2, delta=0.005, num_mc_samples=100):
+    """
+    Lorenz 96 시스템의 모든 X 변수에 대한 불확실성을 포함한 모델 예측과 실제 시뮬레이션을 비교하여 시각화하는 함수
+
+    Args:
+        model: 학습된 dAMZ 모델 (Monte Carlo Dropout 포함)
+        metadata: Lorenz 96 시스템의 메타데이터
+        X_init: X 변수들의 초기 조건
+        Y_init: Y 변수들의 초기 조건
+        t_end: 적분 끝 시간
+        t_start_plot: 시각화 시작 시간
+        delta: 시간 간격
+        num_mc_samples: Monte Carlo 샘플 수
+    """
+    # 시스템 파라미터 추출
+    K = metadata['K']
+    J = metadata['J']
+    F = metadata['F']
+    h = metadata['h']
+    b = metadata['b']
+    c = metadata['c']
+    dt = metadata['dt']
+    
+    # 초기 조건 설정
+    k = np.arange(K)
+    j = np.arange(J * K)
+    # 초기 조건 함수 (multiscale_lorenz.py에서 가져옴)
+    def s(k, K):
+        return 2 * np.pi * k / K
+
+    if X_init is None or Y_init is None:
+        X_init = s(k, K) * (s(k, K) - 1) * (s(k, K) + 1)
+        Y_init = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
+
+    initial_condition = np.concatenate([X_init, Y_init])
+    print(f"초기 조건 X: {X_init}")
+    print(f"초기 조건 Y: {Y_init[:J]} (첫 번째 그룹만 표시)")
+
+    # 실제 시뮬레이션
+    t_eval = np.arange(0, t_end + delta, delta)
+    t_span = (0, t_end)
+
+    try:
+        sol = solve_ivp(
+            fun=lambda t, y: lorenz96_system_equations(t, y, F, h, b, c, K, J),
+            t_span=t_span,
+            y0=initial_condition,
+            t_eval=t_eval,
+            method='RK45',
+            rtol=1e-9,
+            atol=1e-11
+        )
+
+        t_vals = sol.t
+        X_true = sol.y[:K, :].T
+
+        # 시스템 발산 감지
+        if np.any(np.abs(X_true) > 1000) or len(t_vals) < t_end / delta * 0.5:
+            print("경고: 시스템이 발산했습니다. 이 초기 조건은 건너뜁니다.")
+            return
+
+        # 모델 예측 (불확실성 포함)
+        n_M = int(0.05 / dt)
+
+        X_pred_mean = []
+        X_pred_std = []
+        
+        with torch.no_grad():
+            for i in range(n_M + 1, len(X_true)):
+                Z_input = X_true[i-n_M-1:i].reshape(-1)
+                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)
+                
+                # Monte Carlo Dropout을 사용한 불확실성 추정
+                mean_pred, std_pred = model.predict_with_uncertainty(Z_tensor, num_samples=num_mc_samples)
+                X_pred_mean.append(mean_pred[0].numpy())
+                X_pred_std.append(std_pred[0].numpy())
+
+        X_pred_mean = np.array(X_pred_mean)
+        X_pred_std = np.array(X_pred_std)
+        t_pred = t_vals[n_M + 1:]
+        mask = (t_pred >= t_start_plot)
+        t_plot = t_pred[mask]
+        X_true_plot = X_true[n_M + 1:][mask]
+        X_pred_mean_plot = X_pred_mean[mask]
+        X_pred_std_plot = X_pred_std[mask]
+
+        print(f"예측 완료: {len(X_pred_mean)} 개의 예측값 (Monte Carlo 샘플 수: {num_mc_samples})")
+
+        # 모든 변수 시각화 (불확실성 포함)
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+        axes = axes.flatten()
+
+        for i in range(K):
+            ax = axes[i]
+            
+            # 실제 값과 평균 예측
+            ax.plot(t_plot, X_true_plot[:, i], 'b-', label='True', linewidth=2)
+            ax.plot(t_plot, X_pred_mean_plot[:, i], 'r--', label='Pred (mean)', linewidth=2)
+            
+            # 불확실성 구간 (95% 신뢰구간)
+            ax.fill_between(t_plot, 
+                           X_pred_mean_plot[:, i] - 2*X_pred_std_plot[:, i], 
+                           X_pred_mean_plot[:, i] + 2*X_pred_std_plot[:, i], 
+                           alpha=0.1, color='red', label='95% Confidence')
+            
+            # 1 표준편차 구간
+            ax.fill_between(t_plot, 
+                           X_pred_mean_plot[:, i] - X_pred_std_plot[:, i], 
+                           X_pred_mean_plot[:, i] + X_pred_std_plot[:, i], 
+                           alpha=0.2, color='red', label='±1σ')
+            
+            ax.set_xlabel('time t')
+            ax.set_ylabel(f'$X_{i+1}(t)$')
+            ax.set_title(f'Variable {i+1} with Uncertainty')
+            ax.legend()
+            ax.grid(True)
+
+        plt.tight_layout()
+        plt.show()
+
+        # 전체 MSE 및 RMSE 계산 (평균 예측 기준)
+        mse_total = np.mean((X_true_plot - X_pred_mean_plot) ** 2)
+        rmse_total = np.sqrt(mse_total)
+        print(f'전체 예측 MSE: {mse_total:.6f}')
+        print(f'전체 예측 RMSE: {rmse_total:.6f}')
+        
+        # 각 변수별 MSE 계산
+        for i in range(K):
+            mse_var = np.mean((X_true_plot[:, i] - X_pred_mean_plot[:, i]) ** 2)
+            rmse_var = np.sqrt(mse_var)
+            print(f'변수 {i+1} MSE: {mse_var:.6f}, RMSE: {rmse_var:.6f}')
+        
+        # 불확실성 통계
+        mean_uncertainty = np.mean(X_pred_std_plot)
+        max_uncertainty = np.max(X_pred_std_plot)
+        print(f'평균 불확실성 (표준편차): {mean_uncertainty:.6f}')
+        print(f'최대 불확실성 (표준편차): {max_uncertainty:.6f}')
+        
+        # 각 변수별 불확실성
+        for i in range(K):
+            var_mean_uncertainty = np.mean(X_pred_std_plot[:, i])
+            var_max_uncertainty = np.max(X_pred_std_plot[:, i])
+            print(f'변수 {i+1} 평균 불확실성: {var_mean_uncertainty:.6f}, 최대 불확실성: {var_max_uncertainty:.6f}')
 
     except Exception as e:
         print(f"시뮬레이션 중 오류 발생: {e}")
@@ -862,155 +1029,6 @@ def evaluate_extrapolation_performance(model, metadata, num_trials=5, t_end=10, 
     else:
         print("성공한 시도가 없습니다!")
         return [], None
-
-
-def simulate_and_plot_lorenz96_with_uncertainty(model, metadata, t_end=10, t_start_plot=2, delta=0.005, num_mc_samples=100):
-    """
-    Lorenz 96 시스템의 첫 번째 변수(X1)에 대한 불확실성을 포함한 모델 예측과 실제 시뮬레이션을 비교하여 시각화하는 함수
-
-    Args:
-        model: 학습된 dAMZ 모델 (Monte Carlo Dropout 포함)
-        metadata: Lorenz 96 시스템의 메타데이터
-        t_end: 적분 끝 시간
-        t_start_plot: 시각화 시작 시간
-        delta: 시간 간격
-        num_mc_samples: Monte Carlo 샘플 수
-    """
-    # 시스템 파라미터 추출
-    K = metadata['K']
-    J = metadata['J']
-    F = metadata['F']
-    h = metadata['h']
-    b = metadata['b']
-    c = metadata['c']
-    dt = metadata['dt']
-    
-    # 초기 조건 설정 (Lorenz 96 시스템에 맞는 초기 조건)
-    k = np.arange(K)
-    j = np.arange(J * K)
-    
-    # 초기 조건 함수 (multiscale_lorenz.py에서 가져옴)
-    def s(k, K):
-        return 2 * np.pi * k / K
-    
-    X_init = s(k, K) * (s(k, K) - 1) * (s(k, K) + 1)
-    Y_init = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
-    
-    initial_condition = np.concatenate([X_init, Y_init])
-    print(f"초기 조건 X: {X_init}")
-    print(f"초기 조건 Y: {Y_init[:J]} (첫 번째 그룹만 표시)")
-
-    # 실제 시뮬레이션
-    t_eval = np.arange(0, t_end + delta, delta)
-    t_span = (0, t_end)
-
-    try:
-        # Lorenz 96 시스템 적분
-        sol = solve_ivp(
-            fun=lambda t, y: lorenz96_system_equations(t, y, F, h, b, c, K, J),
-            t_span=t_span,
-            y0=initial_condition,
-            t_eval=t_eval,
-            method='RK45',
-            rtol=1e-9,
-            atol=1e-11
-        )
-
-        t_vals = sol.t
-        X_true = sol.y[:K, :].T  # X 변수들만 추출
-        x1_true = X_true[:, 0]  # 첫 번째 변수
-
-        print(f"시뮬레이션 완료: {len(t_vals)} 시간 스텝")
-        print(f"X1 범위: [{x1_true.min():.3f}, {x1_true.max():.3f}]")
-
-        # 시스템 발산 감지
-        if np.any(np.abs(x1_true) > 1000) or len(t_vals) < t_end / delta * 0.5:
-            print("경고: 시스템이 발산했습니다. 이 초기 조건은 건너뜁니다.")
-            return
-
-        # 모델 예측 (불확실성 포함)
-        n_M = int(0.05 / dt)  # 메모리 길이
-
-        # 메모리 항목들을 포함한 입력 데이터 준비
-        x1_pred_mean = []
-        x1_pred_std = []
-        
-        with torch.no_grad():
-            for i in range(n_M + 1, len(X_true)):
-                # Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
-                Z_input = X_true[i-n_M-1:i].reshape(-1)  # [D]
-                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)  # [1, D]
-
-                # Monte Carlo Dropout을 사용한 불확실성 추정
-                mean_pred, std_pred = model.predict_with_uncertainty(Z_tensor, num_samples=num_mc_samples)
-                x1_pred_mean.append(mean_pred[0, 0].item())  # X1 평균 예측값
-                x1_pred_std.append(std_pred[0, 0].item())    # X1 표준편차
-
-        print(f"예측 완료: {len(x1_pred_mean)} 개의 예측값 (Monte Carlo 샘플 수: {num_mc_samples})")
-
-        # 시각화
-        t_pred = t_vals[n_M + 1:]
-        mask = (t_pred >= t_start_plot)
-        t_plot = t_pred[mask]
-        x1_true_plot = x1_true[n_M + 1:][mask]
-        x1_pred_mean_plot = np.array(x1_pred_mean)[mask]
-        x1_pred_std_plot = np.array(x1_pred_std)[mask]
-
-        print(f"필터링 후 데이터: {len(t_plot)} 개의 시간 포인트")
-        print(f"t_plot 범위: [{t_plot.min():.3f}, {t_plot.max():.3f}]")
-
-        if len(t_plot) == 0:
-            print("경고: 필터링 후 데이터가 없습니다!")
-            print(f"t_start_plot={t_start_plot}, t_pred 범위=[{t_pred.min():.3f}, {t_pred.max():.3f}]")
-            return
-
-        # 불확실성을 포함한 시각화
-        plt.figure(figsize=(12, 8))
-        
-        # 실제 값과 평균 예측
-        plt.plot(t_plot, x1_true_plot, 'b-', label='True $X_1(t)$', linewidth=2)
-        plt.plot(t_plot, x1_pred_mean_plot, 'r--', label='Pred $X_1(t)$ (mean)', linewidth=2)
-        
-        # 불확실성 구간 (95% 신뢰구간)
-        plt.fill_between(t_plot, 
-                        x1_pred_mean_plot - 2*x1_pred_std_plot, 
-                        x1_pred_mean_plot + 2*x1_pred_std_plot, 
-                        alpha=0.1, color='red', label='95% Confidence Interval')
-        
-        # 1 표준편차 구간
-        plt.fill_between(t_plot, 
-                        x1_pred_mean_plot - x1_pred_std_plot, 
-                        x1_pred_mean_plot + x1_pred_std_plot, 
-                        alpha=0.1, color='red', label='±1σ Interval')
-        
-        plt.xlabel('time t')
-        plt.ylabel('$X_1(t)$')
-        plt.title(f'Lorenz 96 dAMZ prediction with uncertainty [{t_start_plot}, {t_end}]')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-        # MSE 및 RMSE 계산 (평균 예측 기준)
-        mse = np.mean((x1_true_plot - x1_pred_mean_plot) ** 2)
-        rmse = np.sqrt(mse)
-        print(f'예측 MSE: {mse:.6f}')
-        print(f'예측 RMSE: {rmse:.6f}')
-        
-        # 데이터 범위 대비 상대적 오차
-        data_range = x1_true_plot.max() - x1_true_plot.min()
-        relative_error = rmse / data_range * 100
-        print(f'상대적 오차: {relative_error:.2f}%')
-        
-        # 불확실성 통계
-        mean_uncertainty = np.mean(x1_pred_std_plot)
-        max_uncertainty = np.max(x1_pred_std_plot)
-        print(f'평균 불확실성 (표준편차): {mean_uncertainty:.6f}')
-        print(f'최대 불확실성 (표준편차): {max_uncertainty:.6f}')
-
-    except Exception as e:
-        print(f"시뮬레이션 중 오류 발생: {e}")
-        print(f"초기 조건에서 시스템이 불안정할 수 있습니다.")
 
 
 def evaluate_extrapolation_performance_with_uncertainty(model, metadata, num_trials=5, t_end=10, t_start_plot=2, delta=0.005, num_mc_samples=100):
@@ -1162,18 +1180,17 @@ def evaluate_extrapolation_performance_with_uncertainty(model, metadata, num_tri
         return [], None, []
 
 
-def simulate_and_plot_lorenz96_all_variables(model, metadata, t_end=10, t_start_plot=2, delta=0.005):
-    """
-    Lorenz 96 시스템의 모든 X 변수에 대한 모델 예측과 실제 시뮬레이션을 비교하여 시각화하는 함수
+if __name__ == "__main__":
+    # 설정
+    hidden_dim = 30
+    epochs = 2000
+    J0 = 50
+    # 기존에 생성한 Lorenz 96 system dataset 이용
+    print("\n[+] Loading Lorenz 96 system dataset...")
+    results_dir = os.path.join(os.getcwd(), "simulated_data")
+    with open(os.path.join(results_dir, "metadata.json"), "r") as f:
+        metadata = json.load(f)
 
-    Args:
-        model: 학습된 dAMZ 모델
-        metadata: Lorenz 96 시스템의 메타데이터
-        t_end: 적분 끝 시간
-        t_start_plot: 시각화 시작 시간
-        delta: 시간 간격
-    """
-    # 시스템 파라미터 추출
     K = metadata['K']
     J = metadata['J']
     F = metadata['F']
@@ -1181,267 +1198,119 @@ def simulate_and_plot_lorenz96_all_variables(model, metadata, t_end=10, t_start_
     b = metadata['b']
     c = metadata['c']
     dt = metadata['dt']
+    si = metadata['si']
+    spinup_time = metadata['spinup_time']
+    forecast_time = metadata['forecast_time']
+    num_ic = metadata['num_ic']
+
+    # 메모리 길이를 더 작게 설정하여 차원 문제 해결
+    memory_length_TM = 0.05  # 0.1에서 0.05로 줄임
+    n_M = int(memory_length_TM / dt)
     
-    # 초기 조건 설정
-    k = np.arange(K)
-    j = np.arange(J * K)
-    
-    def s(k, K):
-        return 2 * np.pi * k / K
-    
-    X_init = s(k, K) * (s(k, K) - 1) * (s(k, K) + 1)
-    Y_init = 0 * s(j, J * K) * (s(j, J * K) - 1) * (s(j, J * K) + 1)
-    
-    initial_condition = np.concatenate([X_init, Y_init])
-
-    # 실제 시뮬레이션
-    t_eval = np.arange(0, t_end + delta, delta)
-    t_span = (0, t_end)
-
-    try:
-        sol = solve_ivp(
-            fun=lambda t, y: lorenz96_system_equations(t, y, F, h, b, c, K, J),
-            t_span=t_span,
-            y0=initial_condition,
-            t_eval=t_eval,
-            method='RK45',
-            rtol=1e-9,
-            atol=1e-11
-        )
-
-        t_vals = sol.t
-        X_true = sol.y[:K, :].T
-
-        # 모델 예측
-        model.eval()
-        n_M = int(0.05 / dt)
-
-        X_pred = []
-        with torch.no_grad():
-            for i in range(n_M + 1, len(X_true)):
-                Z_input = X_true[i-n_M-1:i].reshape(-1)
-                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)
-                z_pred = model(Z_tensor)
-                X_pred.append(z_pred[0].numpy())
-
-        X_pred = np.array(X_pred)
-        t_pred = t_vals[n_M + 1:]
-        mask = (t_pred >= t_start_plot)
-        t_plot = t_pred[mask]
-        X_true_plot = X_true[n_M + 1:][mask]
-        X_pred_plot = X_pred[mask]
-
-        # 모든 변수 시각화
-        fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-        axes = axes.flatten()
-
-        for i in range(K):
-            ax = axes[i]
-            ax.plot(t_plot, X_true_plot[:, i], 'b-', label='True', linewidth=2)
-            ax.plot(t_plot, X_pred_plot[:, i], 'r--', label='Pred', linewidth=2)
-            ax.set_xlabel('time t')
-            ax.set_ylabel(f'$X_{i+1}(t)$')
-            ax.set_title(f'Variable {i+1}')
-            ax.legend()
-            ax.grid(True)
-
-        plt.tight_layout()
-        plt.show()
-
-        # 전체 MSE 및 RMSE 계산
-        mse_total = np.mean((X_true_plot - X_pred_plot) ** 2)
-        rmse_total = np.sqrt(mse_total)
-        print(f'전체 예측 MSE: {mse_total:.6f}')
-        print(f'전체 예측 RMSE: {rmse_total:.6f}')
-        
-        # 각 변수별 MSE 계산
-        for i in range(K):
-            mse_var = np.mean((X_true_plot[:, i] - X_pred_plot[:, i]) ** 2)
-            rmse_var = np.sqrt(mse_var)
-            print(f'변수 {i+1} MSE: {mse_var:.6f}, RMSE: {rmse_var:.6f}')
-
-    except Exception as e:
-        print(f"시뮬레이션 중 오류 발생: {e}")
-
-
-if __name__ == "__main__":
-    # 설정
-    test_chaotic_system, test_lorenz_system = False, True
-    hidden_dim = 30
-    epochs = 2000
-    J0 = 50
-    if test_chaotic_system:
-        dt = 0.02
-        memory_length_TM = 1.2
-
-        # ChaoticSystem 인스턴스 생성
-        chaotic_system = ChaoticSystem(
-            dt=dt,
-            N_T=100,
-            memory_length_TM=memory_length_TM,
-            eps=0.01,
-            selection_mode='random'
-        )
-        n_M = chaotic_system.memory_range_NM  # 메모리 항목 수
-
-        # Trajectory 생성
-        trajectories = chaotic_system.generate_trajectories(K=100, delta=dt)
-        print(f"생성된 trajectory 수: {len(trajectories)}")
-        print(f"각 trajectory shape: {trajectories[0].shape}")
-
-        # 학습 데이터 생성
-        Z, z = create_training_dataset(trajectories, n_M, selection_mode='random', J0=J0)
-                
-        # 학습
-        print("\n[+] Training model...")
-        train_model(model, Z, z, epochs=epochs, lr=1e-3, batch_size=32)
-        
-        print("\n[+] Lorenz 96 시스템 학습 완료!")
-
-        # 모델 생성 - 새로운 dAMZ 구조에 맞게 수정
-        d = 3  # 축소된 변수 차원 (x1, x2, x3)
-        model = dAMZ(d=d, n_M=n_M, hidden_dim=hidden_dim)
-
-        # 모델 구조 정보 출력
-        model_info = model.get_memory_structure_info()
-        print(f"\n[+] dAMZ 모델 구조:")
-        print(f"  - 축소된 변수 차원 (d): {model_info['d']}")
-        print(f"  - 메모리 항목 수 (n_M): {model_info['n_M']}")
-        print(f"  - 입력 차원 (D): {model_info['D']}")
-        print(f"  - 출력 차원: {model_info['output_dim']}")
-        print(f"  - 실제 입력 데이터 shape: {Z.shape}")
-        print(f"  - 실제 출력 데이터 shape: {z.shape}")
-
-        # 학습
-        print("\n[+] Training model...")
-        train_model(model, Z, z, epochs=epochs, lr=1e-3, batch_size=32)
-
-        # 시뮬레이션 vs 예측 시각화 (더 짧은 구간으로 테스트)
-        print("\n[+] Simulating and plotting prediction vs ground truth...")
-
-        # 여러 초기 조건으로 테스트
-        for i in range(3):
-            print(f"\n--- 테스트 {i+1} ---")
-            simulate_and_plot_x1_prediction(model, chaotic_system, t_end=50, t_start_plot=2, delta=0.02)
-    
-    if test_lorenz_system:
-        # 기존에 생성한 Lorenz 96 system dataset 이용
-        print("\n[+] Loading Lorenz 96 system dataset...")
-        results_dir = os.path.join(os.getcwd(), "simulated_data")
-        with open(os.path.join(results_dir, "metadata.json"), "r") as f:
-            metadata = json.load(f)
-
-        K = metadata['K']
-        J = metadata['J']
-        F = metadata['F']
-        h = metadata['h']
-        b = metadata['b']
-        c = metadata['c']
-        dt = metadata['dt']
-        si = metadata['si']
-        spinup_time = metadata['spinup_time']
-        forecast_time = metadata['forecast_time']
-        num_ic = metadata['num_ic']
-
-        # 메모리 길이를 더 작게 설정하여 차원 문제 해결
-        memory_length_TM = 0.05  # 0.1에서 0.05로 줄임
-        n_M = int(memory_length_TM / dt)
-        
-        # 데이터 로드 및 전처리
-        trajectories = []
-        for i in range(1, min(num_ic + 1, 51)):  # 처음 50개만 사용하여 메모리 절약
-            try:
-                X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_{i}.npy"))
-                # X_data shape: (1, time_steps, 8) -> (time_steps, 8)로 변환
-                trajectory = X_data[0]  # 첫 번째 배치만 사용
-                
-                # 데이터 품질 체크
-                if np.any(np.isnan(trajectory)) or np.any(np.isinf(trajectory)):
-                    print(f"경고: 배치 {i}에서 NaN 또는 Inf 값이 발견되어 건너뜁니다.")
-                    continue
-                    
-                # 극단적인 값 필터링
-                if np.any(np.abs(trajectory) > 1000):
-                    print(f"경고: 배치 {i}에서 극단적인 값이 발견되어 건너뜁니다.")
-                    continue
-                    
-                trajectories.append(trajectory)
-            except Exception as e:
-                print(f"배치 {i} 로드 중 오류: {e}")
+    # 데이터 로드 및 전처리
+    trajectories = []
+    for i in range(1, min(num_ic + 1, 51)):  # 처음 50개만 사용하여 메모리 절약
+        try:
+            X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_single_{i}.npy"))
+            # X_data shape: (1, time_steps, 8) -> (time_steps, 8)로 변환
+            trajectory = X_data[0]  # 첫 번째 배치만 사용
+            
+            # 데이터 품질 체크
+            if np.any(np.isnan(trajectory)) or np.any(np.isinf(trajectory)):
+                print(f"경고: 배치 {i}에서 NaN 또는 Inf 값이 발견되어 건너뜁니다.")
                 continue
+                
+            # 극단적인 값 필터링
+            if np.any(np.abs(trajectory) > 1000):
+                print(f"경고: 배치 {i}에서 극단적인 값이 발견되어 건너뜁니다.")
+                continue
+                
+            trajectories.append(trajectory)
+        except Exception as e:
+            print(f"배치 {i} 로드 중 오류: {e}")
+            continue
 
-        print(f"로드된 trajectory 수: {len(trajectories)}")            
-        print(f"첫 번째 trajectory shape: {trajectories[0].shape}")
-        
-        Z, z = create_training_dataset(trajectories, n_M, selection_mode='random', J0=J0)
-        
-        # 데이터 품질 체크
-        print(f"Z 데이터 통계: min={Z.min():.4f}, max={Z.max():.4f}, mean={Z.mean():.4f}, std={Z.std():.4f}")
-        print(f"z 데이터 통계: min={z.min():.4f}, max={z.max():.4f}, mean={z.mean():.4f}, std={z.std():.4f}")
-        
-        if np.any(np.isnan(Z)) or np.any(np.isnan(z)):
-            print("오류: 학습 데이터에 NaN 값이 포함되어 있습니다!")
-            sys.exit(1)
+    print(f"로드된 trajectory 수: {len(trajectories)}")            
+    print(f"첫 번째 trajectory shape: {trajectories[0].shape}")
+    
+    Z, z = create_training_dataset(trajectories, n_M, selection_mode='random', J0=J0)
+    
+    # 데이터 품질 체크
+    print(f"Z 데이터 통계: min={Z.min():.4f}, max={Z.max():.4f}, mean={Z.mean():.4f}, std={Z.std():.4f}")
+    print(f"z 데이터 통계: min={z.min():.4f}, max={z.max():.4f}, mean={z.mean():.4f}, std={z.std():.4f}")
+    
+    if np.any(np.isnan(Z)) or np.any(np.isnan(z)):
+        print("오류: 학습 데이터에 NaN 값이 포함되어 있습니다!")
+        sys.exit(1)
 
-        # Lorenz 96 시스템에 맞는 모델 생성 (Monte Carlo Dropout 포함)
-        d = 8  # Lorenz 96 시스템의 변수 수
-        dropout_rate = 0.1  # dropout 비율
-        print(f"모델 생성 시작: d={d}, n_M={n_M}, hidden_dim={hidden_dim}, dropout_rate={dropout_rate}")
-        model = dAMZ(d=d, n_M=n_M, hidden_dim=hidden_dim, dropout_rate=dropout_rate)
-        print("모델 생성 완료")
-        
-        # 모델 구조 정보 출력
-        model_info = model.get_memory_structure_info()
-        print(f"\n[+] dAMZ 모델 구조 (Lorenz 96):")
-        print(f"  - 축소된 변수 차원 (d): {model_info['d']}")
-        print(f"  - 메모리 항목 수 (n_M): {model_info['n_M']}")
-        print(f"  - 입력 차원 (D): {model_info['D']}")
-        print(f"  - 출력 차원: {model_info['output_dim']}")
-        print(f"  - 실제 입력 데이터 shape: {Z.shape}")
-        print(f"  - 실제 출력 데이터 shape: {z.shape}")
+    # Lorenz 96 시스템에 맞는 모델 생성 (Monte Carlo Dropout 포함)
+    reduced_order_d = K  # Lorenz 96 시스템의 변수 수
+    dropout_rate = 0.1  # dropout 비율
+    print(f"모델 생성 시작: reduced_order_d={reduced_order_d}, n_M={n_M}, hidden_dim={hidden_dim}, dropout_rate={dropout_rate}")
+    model = dAMZ(d=reduced_order_d, n_M=n_M, hidden_dim=hidden_dim, dropout_rate=dropout_rate)
+    print("모델 생성 완료")
+    
+    # 모델 구조 정보 출력
+    model_info = model.get_memory_structure_info()
+    print(f"\n[+] dAMZ 모델 구조 (Lorenz 96):")
+    print(f"  - 축소된 변수 차원 (d): {model_info['d']}")
+    print(f"  - 메모리 항목 수 (n_M): {model_info['n_M']}")
+    print(f"  - 입력 차원 (D): {model_info['D']}")
+    print(f"  - 출력 차원: {model_info['output_dim']}")
+    print(f"  - 실제 입력 데이터 shape: {Z.shape}")
+    print(f"  - 실제 출력 데이터 shape: {z.shape}")
 
-        print("\n[+] Training model...")
-        # 더 안정적인 학습 파라미터 사용
-        losses = train_model(
-            model, Z, z, 
-            epochs=epochs, 
-            lr=5e-4,  # 더 작은 학습률
-            batch_size=256,  # 더 작은 배치 크기
-            normalize=True,  # 데이터 정규화 활성화
-            clip_grad_norm=0.5  # 그래디언트 클리핑
-        )
+    print("\n[+] Training model...")
+    # 더 안정적인 학습 파라미터 사용
+    losses = train_model(
+        model, Z, z, 
+        epochs=epochs, 
+        lr=5e-4,  # 더 작은 학습률
+        batch_size=256,  # 더 작은 배치 크기
+        normalize=True,  # 데이터 정규화 활성화
+        clip_grad_norm=0.5  # 그래디언트 클리핑
+    )
+    
+    print("\n[+] Lorenz 96 시스템 학습 완료!")
+    
+    # 학습 손실 그래프 시각화
+    plt.figure(figsize=(10, 6))
+    plt.plot(losses)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss')
+    plt.yscale('log')
+    plt.grid(True)
+    plt.show()
+    
+    batch_num = np.random.randint(1, 300)
+    X_init = None #np.load(os.path.join(os.getcwd(), "simulated_data", f"ic_X_batch_coupled_{batch_num}.npy"))
+    Y_init = None #np.load(os.path.join(os.getcwd(), "simulated_data", f"ic_Y_batch_coupled_{batch_num}.npy"))
+    
+    # 예측 시각화
+    print("\n[+] Simulating and plotting prediction vs ground truth...")
+    
+    # 첫 번째 변수만 시각화
+    print("\n--- 첫 번째 변수(X1) 예측 ---")
+    simulate_and_plot_lorenz96_x1_prediction(model, metadata, X_init, Y_init, t_end=5, t_start_plot=1, delta=0.005)
         
-        print("\n[+] Lorenz 96 시스템 학습 완료!")
-        
-        # 학습 손실 그래프 시각화
-        plt.figure(figsize=(10, 6))
-        plt.plot(losses)
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training Loss')
-        plt.yscale('log')
-        plt.grid(True)
-        plt.show()
-        
-        # 예측 시각화
-        print("\n[+] Simulating and plotting prediction vs ground truth...")
-        
-        # 첫 번째 변수만 시각화
-        print("\n--- 첫 번째 변수(X1) 예측 ---")
-        simulate_and_plot_lorenz96_x1_prediction(model, metadata, t_end=5, t_start_plot=1, delta=0.005)
-        
-        # 불확실성을 포함한 첫 번째 변수 예측
-        print("\n--- 첫 번째 변수(X1) 예측 (불확실성 포함) ---")
-        simulate_and_plot_lorenz96_with_uncertainty(model, metadata, t_end=5, t_start_plot=1, delta=0.005, num_mc_samples=100)
-        
-        # 모든 변수 시각화
-        print("\n--- 모든 변수 예측 ---")
-        simulate_and_plot_lorenz96_all_variables(model, metadata, t_end=5, t_start_plot=1, delta=0.005)
+    # 모든 변수 시각화
+    print("\n--- 모든 변수 예측 ---")
+    simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, X_init, Y_init, t_end=5, t_start_plot=1, delta=0.005)
 
-        # Extrapolation 성능 평가
-        print("\n[+] Extrapolation 성능 평가...")
-        evaluate_extrapolation_performance(model, metadata, num_trials=5, t_end=5, t_start_plot=1, delta=0.005)
+    # Random IC에 대한 Extrapolation 성능 평가
+    print("\n[+] Random IC에 대한 Extrapolation 성능 평가...")
+    evaluate_extrapolation_performance(model, metadata, num_trials=5, t_end=5, t_start_plot=1, delta=0.005)
 
-        # 불확실성을 포함한 Extrapolation 성능 평가
-        print("\n[+] Extrapolation 성능 평가 (불확실성 포함)...")
-        evaluate_extrapolation_performance_with_uncertainty(model, metadata, num_trials=5, t_end=5, t_start_plot=1, delta=0.005, num_mc_samples=100)
+    # 불확실성을 포함한 첫 번째 변수 예측
+    print("\n--- 첫 번째 변수(X1) 예측 (불확실성 포함) ---")
+    simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, X_init, Y_init, t_end=5, t_start_plot=1, delta=0.005, num_mc_samples=100)
+
+    # 불확실성을 포함한 모든 변수 시각화
+    print("\n--- 모든 변수 예측 (불확실성 포함) ---")
+    simulate_and_plot_lorenz96_all_variables_prediction_with_uncertainty(model, metadata, X_init, Y_init, t_end=5, t_start_plot=1, delta=0.005, num_mc_samples=100)
+
+
+    # 불확실성을 포함한 Random IC에 대한 Extrapolation 성능 평가
+    print("\n[+] Random IC에 대한 Extrapolation 성능 평가 (불확실성 포함)...")
+    evaluate_extrapolation_performance_with_uncertainty(model, metadata, num_trials=5, t_end=5, t_start_plot=1, delta=0.005, num_mc_samples=100)

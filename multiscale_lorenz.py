@@ -5,6 +5,10 @@ https://www.ecmwf.int/en/elibrary/10829-predictability-problem-partly-solved
 """
 
 import os
+
+# OpenMP 중복 라이브러리 로드 문제 해결
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 import numpy as np
 
 from numba import jit, njit
@@ -634,6 +638,8 @@ if __name__ == "__main__":
     all_t = np.zeros((num_ic, time_steps_per_ic))
     all_C = np.zeros((num_ic, time_steps_per_ic, K))
 
+    ic_X = np.zeros((num_ic, K))
+    ic_Y = np.zeros((num_ic, J * K))
 
     import time
     start_time = time.time()
@@ -666,6 +672,8 @@ if __name__ == "__main__":
         all_Y[count_ic] = Y_forecast
         all_t[count_ic] = t_forecast
         all_C[count_ic] = C_forecast
+        ic_X[count_ic] = coupled_system.X
+        ic_Y[count_ic] = coupled_system.Y
         count_ic += 1
         coupled_system.randomize_IC()
 
@@ -691,12 +699,14 @@ if __name__ == "__main__":
         batch_Y = all_Y[start_idx:end_idx]
         batch_t = all_t[start_idx:end_idx]
         batch_C = all_C[start_idx:end_idx]
-
+        batch_ic_X = ic_X[start_idx:end_idx]
+        batch_ic_Y = ic_Y[start_idx:end_idx]
         np.save(f"{results_dir}/X_batch_coupled_{batch+1}.npy", batch_X)
         np.save(f"{results_dir}/Y_batch_coupled_{batch+1}.npy", batch_Y)
         np.save(f"{results_dir}/t_batch_coupled_{batch+1}.npy", batch_t)
         np.save(f"{results_dir}/C_batch_coupled_{batch+1}.npy", batch_C)
-
+        np.save(f"{results_dir}/ic_X_batch_coupled_{batch+1}.npy", batch_ic_X)
+        np.save(f"{results_dir}/ic_Y_batch_coupled_{batch+1}.npy", batch_ic_Y)
 
 
     print(f"\n총 {num_ic}개의 검증된 single system 데이터 생성 시작...")
