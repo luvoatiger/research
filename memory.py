@@ -1211,7 +1211,7 @@ if __name__ == "__main__":
     trajectories = []
     for i in range(1, min(num_ic + 1, 51)):  # 처음 50개만 사용하여 메모리 절약
         try:
-            X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_single_{i}.npy"))
+            X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_coupled_{i}.npy"))
             # X_data shape: (1, time_steps, 8) -> (time_steps, 8)로 변환
             trajectory = X_data[0]  # 첫 번째 배치만 사용
             
@@ -1284,9 +1284,13 @@ if __name__ == "__main__":
     plt.show()
     
     batch_num = np.random.randint(1, 300)
-    X_init = None #np.load(os.path.join(os.getcwd(), "simulated_data", f"ic_X_batch_coupled_{batch_num}.npy"))
-    Y_init = None #np.load(os.path.join(os.getcwd(), "simulated_data", f"ic_Y_batch_coupled_{batch_num}.npy"))
-    
+    X_init = np.load(os.path.join(os.getcwd(), "simulated_data", f"ic_X_batch_coupled_{batch_num}.npy"))
+    Y_init = np.load(os.path.join(os.getcwd(), "simulated_data", f"ic_Y_batch_coupled_{batch_num}.npy"))
+    if X_init.ndim == 2:
+        X_init = X_init[0] # shape: [K]
+    if Y_init.ndim == 2:
+        Y_init = Y_init[0] # shape: [K*J]
+
     # 예측 시각화
     print("\n[+] Simulating and plotting prediction vs ground truth...")
     
