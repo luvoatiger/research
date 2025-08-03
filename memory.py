@@ -147,14 +147,13 @@ class dAMZ(nn.Module):
         
         return z_next
 
-    def forward(self, Z_in, enable_dropout=True, use_rk4=False):
+    def forward(self, Z_in, enable_dropout=True):
         """
         Forward pass
         
         Args:
             Z_in (torch.Tensor): 입력 텐서 [batch_size, D]
             enable_dropout (bool): Dropout 활성화 여부
-            use_rk4 (bool): RK4 적분 사용 여부 (True: RK4, False: Euler)
             
         Returns:
             torch.Tensor: 출력 텐서 [batch_size, d]
@@ -166,32 +165,27 @@ class dAMZ(nn.Module):
         Z_in_matrix = Z_in.unsqueeze(2)
         z_n = torch.bmm(I_hat_batch, Z_in_matrix).squeeze(2)
 
-        if use_rk4:
-            # RK4 적분 사용
-            z_out = self.rk4_step(z_n, Z_in, enable_dropout)
+        # Euler 적분 사용
+        markov_term = self.lorenz96_markov_term(z_n)
+
+        if enable_dropout:
+            self.neural_network.train()
         else:
-            # Euler 적분 사용 (기존 방식)
-            markov_term = self.lorenz96_markov_term(z_n)
+            self.neural_network.eval()
+            
+        memory_term = self.neural_network(Z_in)
 
-            if enable_dropout:
-                self.neural_network.train()
-            else:
-                self.neural_network.eval()
-                
-            memory_term = self.neural_network(Z_in)
-
-            z_out = z_n + self.dt * (markov_term + memory_term)
+        z_out = z_n + self.dt * (markov_term + memory_term)
 
         return z_out
 
-    def predict_with_uncertainty(self, Z_in, num_samples=100, use_rk4=True):
+    def predict_with_uncertainty(self, Z_in, num_samples=100):
         """
         Monte Carlo Dropout을 사용한 불확실성 추정
         
         Args:
             Z_in (torch.Tensor): 입력 텐서 [batch_size, D]
             num_samples (int): Monte Carlo 샘플 수
-            use_rk4 (bool): RK4 적분 사용 여부
             
         Returns:
             tuple: (mean_prediction, std_prediction)
@@ -203,7 +197,7 @@ class dAMZ(nn.Module):
         predictions = []
         with torch.no_grad():
             for _ in range(num_samples):
-                pred = self.forward(Z_in, enable_dropout=True, use_rk4=use_rk4)
+                pred = self.forward(Z_in, enable_dropout=True)
                 predictions.append(pred)
         
         predictions = torch.stack(predictions, dim=0)
@@ -1315,7 +1309,7 @@ if __name__ == "__main__":
     num_ic = metadata['num_ic']
 
     # 메모리 길이를 더 작게 설정하여 예측 시작점을 앞당김
-    memory_length_TM = 0.05
+    memory_length_TM = 0.01
     n_M = int(memory_length_TM / dt)
     
     # 데이터 로드 및 전처리
@@ -1325,7 +1319,8 @@ if __name__ == "__main__":
             X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_coupled_{i}.npy"))
             # X_data shape: (1, time_steps, 8) -> (time_steps, 8)로 변환
             trajectory = X_data[0]  # 첫 번째 배치만 사용
-            
+            trajectory = trajectory[::2,:]
+            trajectory = trajectory + 0.003*np.std(trajectory, axis=0)*torch.randn(trajectory.shape, device=torch.device('cpu')).numpy()
             # 데이터 품질 체크
             if np.any(np.isnan(trajectory)) or np.any(np.isinf(trajectory)):
                 print(f"경고: 배치 {i}에서 NaN 또는 Inf 값이 발견되어 건너뜁니다.")
@@ -1399,26 +1394,27 @@ if __name__ == "__main__":
     prediction_start_time = (n_M + 1) * dt  # 실제 예측이 시작되는 시간
     
     # 첫 번째 변수만 시각화
+    t_end = 10
     print("\n--- 첫 번째 변수(X1) 예측 ---")
-    simulate_and_plot_lorenz96_x1_prediction(model, metadata, memory_length_TM, X_init, Y_init, t_end=10, t_start_plot=prediction_start_time, delta=0.005)
+    simulate_and_plot_lorenz96_x1_prediction(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
         
     # 모든 변수 시각화
     print("\n--- 모든 변수 예측 ---")
-    simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, memory_length_TM, X_init, Y_init, t_end=10, t_start_plot=prediction_start_time, delta=0.005)
+    simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
 
     # Random IC에 대한 Extrapolation 성능 평가
     print("\n[+] Random IC에 대한 Extrapolation 성능 평가...")
-    evaluate_extrapolation_performance(model, metadata, memory_length_TM, num_trials=5, t_end=10, t_start_plot=prediction_start_time, delta=0.005)
+    evaluate_extrapolation_performance(model, metadata, memory_length_TM, num_trials=5, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
 
     # 불확실성을 포함한 첫 번째 변수 예측
     print("\n--- 첫 번째 변수(X1) 예측 (불확실성 포함) ---")
-    simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, memory_length_TM, X_init, Y_init, t_end=10, t_start_plot=prediction_start_time, delta=0.005, num_mc_samples=100)
+    simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
 
     # 불확실성을 포함한 모든 변수 시각화
     print("\n--- 모든 변수 예측 (불확실성 포함) ---")
-    simulate_and_plot_lorenz96_all_variables_prediction_with_uncertainty(model, metadata, memory_length_TM, X_init, Y_init, t_end=10, t_start_plot=prediction_start_time, delta=0.005, num_mc_samples=100)
+    simulate_and_plot_lorenz96_all_variables_prediction_with_uncertainty(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
 
     # 불확실성을 포함한 Random IC에 대한 Extrapolation 성능 평가
     print("\n[+] Random IC에 대한 Extrapolation 성능 평가 (불확실성 포함)...")
-    evaluate_extrapolation_performance_with_uncertainty(model, metadata, memory_length_TM, num_trials=5, t_end=10, t_start_plot=prediction_start_time, delta=0.005, num_mc_samples=100)
+    evaluate_extrapolation_performance_with_uncertainty(model, metadata, memory_length_TM, num_trials=5, t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
     
