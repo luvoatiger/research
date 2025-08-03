@@ -1310,7 +1310,7 @@ if __name__ == "__main__":
 
     # 메모리 길이를 더 작게 설정하여 예측 시작점을 앞당김
     memory_length_TM = 0.01
-    n_M = int(memory_length_TM / dt)
+    memory_range_NM = int(memory_length_TM / dt)
     
     # 데이터 로드 및 전처리
     trajectories = []
@@ -1339,7 +1339,7 @@ if __name__ == "__main__":
     print(f"로드된 trajectory 수: {len(trajectories)}")            
     print(f"첫 번째 trajectory shape: {trajectories[0].shape}")
     
-    Z, z = create_training_dataset(trajectories, n_M, selection_mode='random', J0=J0)
+    Z, z = create_training_dataset(trajectories, memory_range_NM, selection_mode='random', J0=J0)
     
     # 데이터 품질 체크
     print(f"Z 데이터 통계: min={Z.min():.4f}, max={Z.max():.4f}, mean={Z.mean():.4f}, std={Z.std():.4f}")
@@ -1352,8 +1352,8 @@ if __name__ == "__main__":
     # Lorenz 96 시스템에 맞는 모델 생성 (Monte Carlo Dropout 포함)
     reduced_order_d = K  # Lorenz 96 시스템의 변수 수
     dropout_rate = 0.1  # dropout 비율
-    print(f"모델 생성 시작: reduced_order_d={reduced_order_d}, n_M={n_M}, hidden_dim={hidden_dim}, dropout_rate={dropout_rate}")
-    model = dAMZ(d=reduced_order_d, n_M=n_M, hidden_dim=hidden_dim, dropout_rate=dropout_rate)
+    print(f"모델 생성 시작: reduced_order_d={reduced_order_d}, n_M={memory_range_NM}, hidden_dim={hidden_dim}, dropout_rate={dropout_rate}")
+    model = dAMZ(d=reduced_order_d, n_M=memory_range_NM, hidden_dim=hidden_dim, dropout_rate=dropout_rate)
     print("모델 생성 완료")
     
     # 모델 구조 정보 출력
@@ -1391,7 +1391,7 @@ if __name__ == "__main__":
     print("\n[+] Simulating and plotting prediction vs ground truth...")
     
     # 예측 시작 시간 계산
-    prediction_start_time = (n_M + 1) * dt  # 실제 예측이 시작되는 시간
+    prediction_start_time = (memory_range_NM + 1) * dt  # 실제 예측이 시작되는 시간
     
     # 첫 번째 변수만 시각화
     t_end = 10
@@ -1405,7 +1405,7 @@ if __name__ == "__main__":
     # Random IC에 대한 Extrapolation 성능 평가
     print("\n[+] Random IC에 대한 Extrapolation 성능 평가...")
     evaluate_extrapolation_performance(model, metadata, memory_length_TM, num_trials=5, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
-
+    
     # 불확실성을 포함한 첫 번째 변수 예측
     print("\n--- 첫 번째 변수(X1) 예측 (불확실성 포함) ---")
     simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
