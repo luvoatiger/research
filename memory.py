@@ -48,15 +48,23 @@ class dAMZ(nn.Module):
         self.F = F  # Lorenz 96 강제력
         self.dt = dt  # 시간 간격
 
-        # 신경망 N(⋅; Θ) 정의: R^D → R^d (memory term만 학습)
-        self.neural_network = nn.Sequential(
-            nn.Linear(self.D, hidden_dim),
+        # LSTM 네트워크 N(⋅; Θ) 정의: R^D → R^d (memory term만 학습)
+        # 입력을 시퀀스로 재구성하여 LSTM에 전달
+        self.lstm = nn.LSTM(
+            input_size=d,  # 각 시점의 입력 차원
+            hidden_size=hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            dropout=dropout_rate if 2 > 1 else 0,
+            bidirectional=False
+        )
+        
+        # LSTM 출력을 최종 차원으로 매핑
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),  # 첫 번째 dropout
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),  # 두 번째 dropout
-            nn.Linear(hidden_dim, d)
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim // 2, d)
         )
 
         # 가중치 초기화
@@ -69,6 +77,13 @@ class dAMZ(nn.Module):
             torch.nn.init.xavier_uniform_(module.weight, gain=0.01)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LSTM):
+            # LSTM 가중치 초기화
+            for name, param in module.named_parameters():
+                if 'weight' in name:
+                    torch.nn.init.xavier_uniform_(param, gain=0.01)
+                elif 'bias' in name:
+                    torch.nn.init.zeros_(param)
 
     def lorenz96_markov_term(self, z_n):
         """
@@ -108,11 +123,24 @@ class dAMZ(nn.Module):
         markov_term = self.lorenz96_markov_term(z_n)
         
         if enable_dropout:
-            self.neural_network.train()
+            self.lstm.train()
+            self.output_layer.train()
         else:
-            self.neural_network.eval()
-            
-        memory_term = self.neural_network(Z_in)
+            self.lstm.eval()
+            self.output_layer.eval()
+        
+        # LSTM을 위한 입력 재구성: [batch_size, D] -> [batch_size, n_M+1, d]
+        # Z_in은 [batch_size, D] 형태이고, D = d * (n_M + 1)
+        Z_in_reshaped = Z_in.view(Z_in.shape[0], self.n_M + 1, self.d)
+        
+        # LSTM 처리
+        lstm_out, _ = self.lstm(Z_in_reshaped)
+        
+        # 마지막 시점의 출력만 사용 (가장 최근 정보)
+        last_output = lstm_out[:, -1, :]  # [batch_size, hidden_dim]
+        
+        # 최종 출력층을 통한 매핑
+        memory_term = self.output_layer(last_output)
         
         return markov_term + memory_term
 
@@ -163,11 +191,24 @@ class dAMZ(nn.Module):
         markov_term = self.lorenz96_markov_term(z_n)
 
         if enable_dropout:
-            self.neural_network.train()
+            self.lstm.train()
+            self.output_layer.train()
         else:
-            self.neural_network.eval()
-            
-        memory_term = self.neural_network(Z_in)
+            self.lstm.eval()
+            self.output_layer.eval()
+        
+        # LSTM을 위한 입력 재구성: [batch_size, D] -> [batch_size, n_M+1, d]
+        # Z_in은 [batch_size, D] 형태이고, D = d * (n_M + 1)
+        Z_in_reshaped = Z_in.view(batch_size, self.n_M + 1, self.d)
+        
+        # LSTM 처리
+        lstm_out, _ = self.lstm(Z_in_reshaped)
+        
+        # 마지막 시점의 출력만 사용 (가장 최근 정보)
+        last_output = lstm_out[:, -1, :]  # [batch_size, hidden_dim]
+        
+        # 최종 출력층을 통한 매핑
+        memory_term = self.output_layer(last_output)
 
         z_out = z_n + self.dt * (markov_term + memory_term)
 
@@ -211,7 +252,10 @@ class dAMZ(nn.Module):
             'dropout_rate': self.dropout_rate,
             'F': self.F,
             'dt': self.dt,
-            'integration_method': 'RK4 (default) / Euler (optional)'
+            'integration_method': 'Euler',
+            'neural_network_type': 'LSTM',
+            'lstm_layers': 2,
+            'lstm_hidden_dim': self.lstm.hidden_size
         }
 
 
