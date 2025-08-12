@@ -613,7 +613,7 @@ def simulate_and_plot_lorenz96_x1_prediction(model, metadata, memory_length_TM, 
             
             # Climate Metrics 계산
             climate_metrics = ClimateMetrics()
-            metrics = climate_metrics.calculate_all_metrics(u_pred_1d, u_true_1d)
+            metrics = climate_metrics.calculate_all_metrics(u_pred_1d, u_true_1d, dt=delta)
             
             # 결과 출력
             climate_metrics.print_metrics_summary(metrics)
@@ -740,7 +740,7 @@ def simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, memory_
         try:
             # Climate Metrics 계산
             climate_metrics = ClimateMetrics()
-            metrics = climate_metrics.calculate_all_metrics(X_pred_plot, X_true_plot)
+            metrics = climate_metrics.calculate_all_metrics(X_pred_plot, X_true_plot, dt=delta)
             
             # 결과 출력
             climate_metrics.print_metrics_summary(metrics)
@@ -914,7 +914,7 @@ def simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, m
             
             # Climate Metrics 계산
             climate_metrics = ClimateMetrics()
-            metrics = climate_metrics.calculate_all_metrics(u_pred_1d, u_true_1d)
+            metrics = climate_metrics.calculate_all_metrics(u_pred_1d, u_true_1d, dt=delta)
             
             # 결과 출력
             climate_metrics.print_metrics_summary(metrics)
@@ -1085,7 +1085,7 @@ def simulate_and_plot_lorenz96_all_variables_prediction_with_uncertainty(model, 
         try:
             # Climate Metrics 계산
             climate_metrics = ClimateMetrics()
-            metrics = climate_metrics.calculate_all_metrics(X_pred_mean_plot, X_true_plot)
+            metrics = climate_metrics.calculate_all_metrics(X_pred_mean_plot, X_true_plot, dt=delta)
             
             # 결과 출력
             climate_metrics.print_metrics_summary(metrics)
@@ -1227,7 +1227,7 @@ def evaluate_extrapolation_performance(model, metadata, memory_length_TM, num_tr
             try:
                 print("  - Climate Metrics 계산 중...")
                 climate_metrics = ClimateMetrics()
-                metrics = climate_metrics.calculate_all_metrics(Xpred_ext, X_ext)
+                metrics = climate_metrics.calculate_all_metrics(Xpred_ext, X_ext, dt=delta)
                 
                 print(f"    * Mean State Error: {metrics['mean_state_error_mean']:.6f}")
                 print(f"    * Variance Ratio: {metrics['variance_ratio']:.6f}")
@@ -1394,7 +1394,7 @@ def evaluate_extrapolation_performance_with_uncertainty(model, metadata, memory_
             try:
                 print("  - Climate Metrics 계산 중...")
                 climate_metrics = ClimateMetrics()
-                metrics = climate_metrics.calculate_all_metrics(Xpred_ext, X_ext)
+                metrics = climate_metrics.calculate_all_metrics(Xpred_ext, X_ext, dt=delta)
                 
                 print(f"    * Mean State Error: {metrics['mean_state_error_mean']:.6f}")
                 print(f"    * Variance Ratio: {metrics['variance_ratio']:.6f}")
@@ -1450,8 +1450,8 @@ def evaluate_climate_metrics_from_states(u_true, u_pred, time_axis=None, save_pa
     # ClimateMetrics 클래스 인스턴스 생성
     climate_metrics = ClimateMetrics()
     
-    # 모든 지표 계산
-    metrics = climate_metrics.calculate_all_metrics(u_pred, u_true)
+    # 모든 지표 계산 (dt는 기본값 0.005 사용)
+    metrics = climate_metrics.calculate_all_metrics(u_pred, u_true, dt=0.005)
     
     # 결과 출력
     climate_metrics.print_metrics_summary(metrics)
@@ -1483,8 +1483,8 @@ def evaluate_climate_metrics_with_uncertainty(u_true, u_pred_samples, time_axis=
     # 예측값 평균 계산
     u_pred_mean = np.mean(u_pred_samples, axis=0)
     
-    # 모든 지표 계산 (평균 예측값 기준)
-    metrics = climate_metrics.calculate_all_metrics(u_pred_mean, u_true)
+    # 모든 지표 계산 (평균 예측값 기준, dt는 기본값 0.005 사용)
+    metrics = climate_metrics.calculate_all_metrics(u_pred_mean, u_true, dt=0.005)
     
     # 불확실성 계산을 위한 추가 지표들
     metrics['prediction_std'] = np.std(u_pred_samples, axis=0)
@@ -1493,7 +1493,7 @@ def evaluate_climate_metrics_with_uncertainty(u_true, u_pred_samples, time_axis=
     # 각 Monte Carlo 샘플에 대한 지표들 계산
     all_metrics_samples = []
     for i, u_pred_sample in enumerate(u_pred_samples):
-        sample_metrics = climate_metrics.calculate_all_metrics(u_pred_sample, u_true)
+        sample_metrics = climate_metrics.calculate_all_metrics(u_pred_sample, u_true, dt=0.005)
         all_metrics_samples.append(sample_metrics)
     
     # 지표들의 표준편차 계산 (불확실성 측정)
@@ -1544,7 +1544,7 @@ if __name__ == "__main__":
     num_ic = metadata['num_ic']
 
     # 메모리 길이를 더 작게 설정하여 예측 시작점을 앞당김
-    memory_length_TM = 0.01
+    memory_length_TM = 0.02
     memory_range_NM = int(memory_length_TM / dt)
     
     # 데이터 로드 및 전처리
