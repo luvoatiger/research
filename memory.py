@@ -1,21 +1,15 @@
 import os
 import sys
-
-# OpenMP 중복 라이브러리 로드 문제 해결
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-
 import json
-import time
-import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 
 from scipy.integrate import solve_ivp
+from metrics import ClimateMetrics
 
 class dAMZ(nn.Module):
     """
@@ -565,6 +559,27 @@ def simulate_and_plot_lorenz96_x1_prediction(model, metadata, memory_length_TM, 
         data_range = x1_true_plot.max() - x1_true_plot.min()
         relative_error = rmse / data_range * 100
         print(f'상대적 오차: {relative_error:.2f}%')
+        
+        # Climate Metrics 계산 추가
+        print("\n[+] Climate Metrics 계산...")
+        try:
+            # 데이터 형태 맞추기 (1차원 -> 2차원)
+            u_true_1d = x1_true_plot.reshape(-1, 1)
+            u_pred_1d = x1_pred_plot.reshape(-1, 1)
+            
+            # Climate Metrics 계산
+            climate_metrics = ClimateMetrics()
+            metrics = climate_metrics.calculate_all_metrics(u_pred_1d, u_true_1d)
+            
+            # 결과 출력
+            climate_metrics.print_metrics_summary(metrics)
+            
+            # 시각화 (선택사항)
+            save_path = f"climate_metrics_x1_{t_start_plot}_{t_end}.png"
+            climate_metrics.plot_metrics_over_time(metrics, t_plot, save_path)
+            
+        except Exception as e:
+            print(f"Climate Metrics 계산 중 오류 발생: {e}")
 
     except Exception as e:
         print(f"시뮬레이션 중 오류 발생: {e}")
@@ -675,6 +690,23 @@ def simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, memory_
             mse_var = np.mean((X_true_plot[:, i] - X_pred_plot[:, i]) ** 2)
             rmse_var = np.sqrt(mse_var)
             print(f'변수 {i+1} MSE: {mse_var:.6f}, RMSE: {rmse_var:.6f}')
+        
+        # Climate Metrics 계산 추가
+        print("\n[+] Climate Metrics 계산 (모든 변수)...")
+        try:
+            # Climate Metrics 계산
+            climate_metrics = ClimateMetrics()
+            metrics = climate_metrics.calculate_all_metrics(X_pred_plot, X_true_plot)
+            
+            # 결과 출력
+            climate_metrics.print_metrics_summary(metrics)
+            
+            # 시각화 (선택사항)
+            save_path = f"climate_metrics_all_vars_{t_start_plot}_{t_end}.png"
+            climate_metrics.plot_metrics_over_time(metrics, t_plot, save_path)
+            
+        except Exception as e:
+            print(f"Climate Metrics 계산 중 오류 발생: {e}")
 
     except Exception as e:
         print(f"시뮬레이션 중 오류 발생: {e}")
@@ -828,6 +860,27 @@ def simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, m
         max_uncertainty = np.max(x1_pred_std_plot)
         print(f'평균 불확실성 (표준편차): {mean_uncertainty:.6f}')
         print(f'최대 불확실성 (표준편차): {max_uncertainty:.6f}')
+        
+        # Climate Metrics 계산 추가 (불확실성 포함)
+        print("\n[+] Climate Metrics 계산 (불확실성 포함)...")
+        try:
+            # 데이터 형태 맞추기 (1차원 -> 2차원)
+            u_true_1d = x1_true_plot.reshape(-1, 1)
+            u_pred_1d = x1_pred_mean_plot.reshape(-1, 1)
+            
+            # Climate Metrics 계산
+            climate_metrics = ClimateMetrics()
+            metrics = climate_metrics.calculate_all_metrics(u_pred_1d, u_true_1d)
+            
+            # 결과 출력
+            climate_metrics.print_metrics_summary(metrics)
+            
+            # 시각화 (선택사항)
+            save_path = f"climate_metrics_x1_uncertainty_{t_start_plot}_{t_end}.png"
+            climate_metrics.plot_metrics_over_time(metrics, t_plot, save_path)
+            
+        except Exception as e:
+            print(f"Climate Metrics 계산 중 오류 발생: {e}")
 
     except Exception as e:
         print(f"시뮬레이션 중 오류 발생: {e}")
@@ -982,6 +1035,23 @@ def simulate_and_plot_lorenz96_all_variables_prediction_with_uncertainty(model, 
         for i in range(K):
             var_mean_uncertainty = np.mean(X_pred_std_plot[:, i])
             var_max_uncertainty = np.max(X_pred_std_plot[:, i])
+        
+        # Climate Metrics 계산 추가 (불확실성 포함, 모든 변수)
+        print("\n[+] Climate Metrics 계산 (불확실성 포함, 모든 변수)...")
+        try:
+            # Climate Metrics 계산
+            climate_metrics = ClimateMetrics()
+            metrics = climate_metrics.calculate_all_metrics(X_pred_mean_plot, X_true_plot)
+            
+            # 결과 출력
+            climate_metrics.print_metrics_summary(metrics)
+            
+            # 시각화 (선택사항)
+            save_path = f"climate_metrics_all_vars_uncertainty_{t_start_plot}_{t_end}.png"
+            climate_metrics.plot_metrics_over_time(metrics, t_plot, save_path)
+            
+        except Exception as e:
+            print(f"Climate Metrics 계산 중 오류 발생: {e}")
             print(f'변수 {i+1} 평균 불확실성: {var_mean_uncertainty:.6f}, 최대 불확실성: {var_max_uncertainty:.6f}')
 
     except Exception as e:
@@ -1108,6 +1178,20 @@ def evaluate_extrapolation_performance(model, metadata, memory_length_TM, num_tr
             print(f"  - 분자 (예측 오차 norm): {numerator:.6f}")
             print(f"  - 분모 (실제 데이터 norm): {denominator:.6f}")
             print(f"  - 데이터 포인트 수: {len(X_ext)}")
+            
+            # Climate Metrics 계산 추가
+            try:
+                print("  - Climate Metrics 계산 중...")
+                climate_metrics = ClimateMetrics()
+                metrics = climate_metrics.calculate_all_metrics(Xpred_ext, X_ext)
+                
+                print(f"    * Mean State Error: {metrics['mean_state_error_mean']:.6f}")
+                print(f"    * Variance Ratio: {metrics['variance_ratio']:.6f}")
+                print(f"    * KL Divergence: {metrics['kl_divergence']:.6f}")
+                print(f"    * Extreme Event Freq (Pred/True): {metrics['extreme_event_freq_pred']:.4f}/{metrics['extreme_event_freq_true']:.4f}")
+                
+            except Exception as e:
+                print(f"    * Climate Metrics 계산 중 오류: {e}")
 
         except Exception as e:
             print(f"시뮬레이션 중 오류 발생: {e}")
@@ -1261,6 +1345,23 @@ def evaluate_extrapolation_performance_with_uncertainty(model, metadata, memory_
             print(f"  - 분모 (실제 데이터 norm): {denominator:.6f}")
             print(f"  - 평균 불확실성: {mean_uncertainty:.6f}")
             print(f"  - 데이터 포인트 수: {len(X_ext)}")
+            
+            # Climate Metrics 계산 추가 (불확실성 포함)
+            try:
+                print("  - Climate Metrics 계산 중...")
+                climate_metrics = ClimateMetrics()
+                metrics = climate_metrics.calculate_all_metrics(Xpred_ext, X_ext)
+                
+                print(f"    * Mean State Error: {metrics['mean_state_error_mean']:.6f}")
+                print(f"    * Variance Ratio: {metrics['variance_ratio']:.6f}")
+                print(f"    * KL Divergence: {metrics['kl_divergence']:.6f}")
+                print(f"    * Extreme Event Freq (Pred/True): {metrics['extreme_event_freq_pred']:.4f}/{metrics['extreme_event_freq_true']:.4f}")
+                
+                # 불확실성과 관련된 추가 지표
+                print(f"    * Prediction Std (평균): {np.mean(Xpred_std_ext):.6f}")
+                
+            except Exception as e:
+                print(f"    * Climate Metrics 계산 중 오류: {e}")
 
         except Exception as e:
             print(f"시뮬레이션 중 오류 발생: {e}")
@@ -1283,6 +1384,96 @@ def evaluate_extrapolation_performance_with_uncertainty(model, metadata, memory_
     else:
         print("성공한 시도가 없습니다!")
         return [], None, []
+
+
+
+
+def evaluate_climate_metrics_from_states(u_true, u_pred, time_axis=None, save_path=None):
+    """
+    이미 계산된 true state와 forecasted state를 받아서 기후 예측 지표들을 계산
+    
+    Args:
+        u_true (np.ndarray): 실제 상태 [time_steps, variables] 또는 [time_steps]
+        u_pred (np.ndarray): 예측 상태 [time_steps, variables] 또는 [time_steps]
+        time_axis (np.ndarray): 시간 축 (None인 경우 인덱스 사용)
+        save_path (str): 저장할 파일 경로 (None인 경우 저장하지 않음)
+        
+    Returns:
+        dict: 모든 평가 지표를 포함한 딕셔너리
+    """
+    print("\n[+] Climate Metrics 계산 시작...")
+    
+    # ClimateMetrics 클래스 인스턴스 생성
+    climate_metrics = ClimateMetrics()
+    
+    # 모든 지표 계산
+    metrics = climate_metrics.calculate_all_metrics(u_pred, u_true)
+    
+    # 결과 출력
+    climate_metrics.print_metrics_summary(metrics)
+    
+    # 시각화
+    climate_metrics.plot_metrics_over_time(metrics, time_axis, save_path)
+    
+    return metrics
+
+
+def evaluate_climate_metrics_with_uncertainty(u_true, u_pred_samples, time_axis=None, save_path=None):
+    """
+    불확실성을 포함한 예측 상태들을 받아서 기후 예측 지표들을 계산
+    
+    Args:
+        u_true (np.ndarray): 실제 상태 [time_steps, variables] 또는 [time_steps]
+        u_pred_samples (list): Monte Carlo 샘플들의 리스트 [num_samples, time_steps, variables]
+        time_axis (np.ndarray): 시간 축 (None인 경우 인덱스 사용)
+        save_path (str): 저장할 파일 경로 (None인 경우 저장하지 않음)
+        
+    Returns:
+        dict: 모든 평가 지표를 포함한 딕셔너리 (불확실성 포함)
+    """
+    print("\n[+] Climate Metrics 계산 (불확실성 포함)...")
+    
+    # ClimateMetrics 클래스 인스턴스 생성
+    climate_metrics = ClimateMetrics()
+    
+    # 예측값 평균 계산
+    u_pred_mean = np.mean(u_pred_samples, axis=0)
+    
+    # 모든 지표 계산 (평균 예측값 기준)
+    metrics = climate_metrics.calculate_all_metrics(u_pred_mean, u_true)
+    
+    # 불확실성 계산을 위한 추가 지표들
+    metrics['prediction_std'] = np.std(u_pred_samples, axis=0)
+    metrics['prediction_std_mean'] = np.mean(metrics['prediction_std'])
+    
+    # 각 Monte Carlo 샘플에 대한 지표들 계산
+    all_metrics_samples = []
+    for i, u_pred_sample in enumerate(u_pred_samples):
+        sample_metrics = climate_metrics.calculate_all_metrics(u_pred_sample, u_true)
+        all_metrics_samples.append(sample_metrics)
+    
+    # 지표들의 표준편차 계산 (불확실성 측정)
+    metrics['mean_state_error_std'] = np.std([m['mean_state_error_mean'] for m in all_metrics_samples])
+    metrics['variance_ratio_std'] = np.std([m['variance_ratio'] for m in all_metrics_samples])
+    metrics['kl_divergence_std'] = np.std([m['kl_divergence'] for m in all_metrics_samples])
+    metrics['extreme_event_freq_pred_std'] = np.std([m['extreme_event_freq_pred'] for m in all_metrics_samples])
+    
+    # 결과 출력
+    print("\n" + "="*70)
+    print("           CLIMATE METRICS WITH UNCERTAINTY")
+    print("="*70)
+    print(f"Mean State Error (평균): {metrics['mean_state_error_mean']:.6f} ± {metrics['mean_state_error_std']:.6f}")
+    print(f"Variance Ratio (분산 비율): {metrics['variance_ratio']:.6f} ± {metrics['variance_ratio_std']:.6f}")
+    print(f"KL Divergence (쿨백-라이블러 발산): {metrics['kl_divergence']:.6f} ± {metrics['kl_divergence_std']:.6f}")
+    print(f"Extreme Event Frequency - Prediction: {metrics['extreme_event_freq_pred']:.4f} ± {metrics['extreme_event_freq_pred_std']:.4f}")
+    print(f"Extreme Event Frequency - True: {metrics['extreme_event_freq_true']:.4f}")
+    print(f"Prediction Standard Deviation (평균): {metrics['prediction_std_mean']:.6f}")
+    print("="*70)
+    
+    # 시각화
+    climate_metrics.plot_metrics_over_time(metrics, time_axis, save_path)
+    
+    return metrics
 
 
 if __name__ == "__main__":
@@ -1405,7 +1596,7 @@ if __name__ == "__main__":
     # Random IC에 대한 Extrapolation 성능 평가
     print("\n[+] Random IC에 대한 Extrapolation 성능 평가...")
     evaluate_extrapolation_performance(model, metadata, memory_length_TM, num_trials=5, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
-    
+    '''
     # 불확실성을 포함한 첫 번째 변수 예측
     print("\n--- 첫 번째 변수(X1) 예측 (불확실성 포함) ---")
     simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
@@ -1417,4 +1608,4 @@ if __name__ == "__main__":
     # 불확실성을 포함한 Random IC에 대한 Extrapolation 성능 평가
     print("\n[+] Random IC에 대한 Extrapolation 성능 평가 (불확실성 포함)...")
     evaluate_extrapolation_performance_with_uncertainty(model, metadata, memory_length_TM, num_trials=5, t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
-    
+    '''

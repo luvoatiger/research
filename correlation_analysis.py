@@ -1,7 +1,11 @@
+import os
+
+# OpenMP 중복 라이브러리 로드 문제 해결
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import os
 import random
 from tqdm import tqdm
 import json

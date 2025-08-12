@@ -2,6 +2,10 @@
 Baseline 모델(Learning subgrid-scale models with neural ordinary differential equations, Kim et al., 2023) 구현
 """
 import os
+
+# OpenMP 중복 라이브러리 로드 문제 해결
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
@@ -9,7 +13,7 @@ import torch
 
 
 class SubgridNN(torch.nn.Module):
-    def __init__(self, input_dim=36, hidden_dim=128, output_dim=36):
+    def __init__(self, input_dim=8, hidden_dim=128, output_dim=8):
         """
         Lorenz 96 시스템의 커플링 항을 근사하는 신경망
         
@@ -207,8 +211,8 @@ def compare_coupling_terms(model_path, data_dir, batch_indices=None, time_steps=
     all_true_coupling = []
     
     for idx in batch_indices:
-        X_data = np.load(os.path.join(data_dir, f"X_batch_{idx}.npy"))
-        C_data = np.load(os.path.join(data_dir, f"C_batch_{idx}.npy"))
+        X_data = np.load(os.path.join(data_dir, f"X_batch_coupled_{idx}.npy"))
+        C_data = np.load(os.path.join(data_dir, f"C_batch_coupled_{idx}.npy"))
         
         all_X_data.append(X_data)
         all_true_coupling.append(C_data)
@@ -333,9 +337,9 @@ def plot_hovmoller_diagram(model_path, data_dir, batch_idx=1, save_path=None):
     large_dt = 10*dt
 
     # 데이터 로드
-    X_data = np.load(os.path.join(data_dir, f"X_batch_{batch_idx}.npy"))
-    Y_data = np.load(os.path.join(data_dir, f"Y_batch_{batch_idx}.npy"))
-    C_data = np.load(os.path.join(data_dir, f"C_batch_{batch_idx}.npy"))
+    X_data = np.load(os.path.join(data_dir, f"X_batch_coupled_{batch_idx}.npy"))
+    Y_data = np.load(os.path.join(data_dir, f"Y_batch_coupled_{batch_idx}.npy"))
+    C_data = np.load(os.path.join(data_dir, f"C_batch_coupled_{batch_idx}.npy"))
 
     X_data = torch.from_numpy(X_data).float()
     Y_data = torch.from_numpy(Y_data).float()
@@ -420,19 +424,23 @@ if __name__ == "__main__":
     num_epoch = 2000
 
     # Kang's experimental setup
-    K = 36  # Number of globa-scale variables X
-    J = 10  # Number of local-scale Y variables per single global-scale X variable
-    F = 20  # Forcing
-    h = 1.0  # Coupling coefficient
-    b = 10    # Ratio of amplitudes
-    
-    c = 10    # time-scale ratio 설정
+    import json
+    with open(os.path.join(os.getcwd(), "simulated_data", "metadata.json"), "r") as f:
+        metadata = json.load(f)
+
+    K = metadata["K"]  # Number of globa-scale variables X
+    J = metadata["J"]  # Number of local-scale Y variables per single global-scale X variable
+    F = metadata["F"]  # Forcing
+    h = metadata["h"]  # Coupling coefficient
+    b = metadata["b"]    # Ratio of amplitudes
+    c = metadata["c"]    # time-scale ratio 설정
+
     # 데이터 로드
     data_list = []
     for i in range(1, 301):
-        X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_{i}.npy"))
-        Y_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"Y_batch_{i}.npy"))
-        C_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"C_batch_{i}.npy"))
+        X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_coupled_{i}.npy"))
+        Y_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"Y_batch_coupled_{i}.npy"))
+        C_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"C_batch_coupled_{i}.npy"))
         data_list.append([X_data, Y_data, C_data])
 
     model = NeuralLorenz96(SubgridNN())
@@ -453,7 +461,6 @@ if __name__ == "__main__":
             X_data = torch.from_numpy(data_list[idx][0]).float()
             Y_data = torch.from_numpy(data_list[idx][1]).float()
             C_data = torch.from_numpy(data_list[idx][2]).float()
-
 
             # ramdom_start_point 에서 m_delta_t 만큼의 데이터를 해당 idx의 데이터에서 추출
             sliced_X_data = X_data[:, random_start_point:random_start_point + m_delta_t, :]
