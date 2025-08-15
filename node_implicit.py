@@ -10,6 +10,22 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import torch
+import sys
+import os
+import pickle
+
+# Add current directory to path for metrics import
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(current_dir)
+
+try:
+    from metrics import ClimateMetrics
+    CLIMATE_METRICS_AVAILABLE = True
+    print("ClimateMetrics imported successfully")
+except ImportError as e:
+    print(f"Warning: Could not import ClimateMetrics: {e}")
+    print("Climate metrics calculation will be skipped")
+    CLIMATE_METRICS_AVAILABLE = False
 
 
 class SubgridNN(torch.nn.Module):
@@ -182,239 +198,241 @@ def calculate_loss(batch_X_data, batch_Y_data, predicted_X_data, predicted_Y_dat
     return loss
 
 
-def compare_coupling_terms(model_path, data_dir, batch_indices=None, time_steps=1000, save_path=None):
+def calculate_climate_metrics_for_batch(batch_X_true, batch_Y_true, predicted_X_data, predicted_Y_data, dt=0.005):
     """
-    학습 데이터를 이용하여 학습된 커플링 항과 실제 커플링 항을 비교하는 함수
+    배치 데이터에 대해 climate metrics를 계산하는 함수
     
     Args:
-        model_path: 학습된 모델 경로
-        data_dir: 학습 데이터가 저장된 디렉토리
-        batch_indices: 비교할 배치 인덱스 리스트 (None인 경우 첫 번째 배치 사용)
-        time_steps: 시각화할 시간 단계 수
-        save_path: 그래프 저장 경로 (None인 경우 저장하지 않음)
-    
-    Returns:
-        fig1, fig2: 생성된 그래프 객체들
-    """
-    # 모델 로드
-    subgrid_nn = SubgridNN()
-    model = NeuralLorenz96(subgrid_nn)
-    model.load_state_dict(torch.load(model_path))
-    model.eval()  # 평가 모드로 설정
-    
-    # 배치 인덱스가 지정되지 않은 경우 첫 번째 배치 사용
-    if batch_indices is None:
-        batch_indices = [1]  # 첫 번째 배치
-    
-    # 데이터 로드 및 준비
-    all_X_data = []
-    all_true_coupling = []
-    
-    for idx in batch_indices:
-        X_data = np.load(os.path.join(data_dir, f"X_batch_coupled_{idx}.npy"))
-        C_data = np.load(os.path.join(data_dir, f"C_batch_coupled_{idx}.npy"))
+        batch_X_true: 실제 X 데이터 [batch_size, time_steps, K]
+        batch_Y_true: 실제 Y 데이터 [batch_size, time_steps, K*J]
+        predicted_X_data: 예측된 X 데이터 리스트
+        predicted_Y_data: 예측된 Y 데이터 리스트
+        dt: 시간 간격
         
-        all_X_data.append(X_data)
-        all_true_coupling.append(C_data)
+    Returns:
+        dict: climate metrics 결과
+    """
+    if not CLIMATE_METRICS_AVAILABLE:
+        print("ClimateMetrics not available. Skipping climate metrics calculation.")
+        return None
     
-    # 데이터 결합
-    X_data = np.concatenate(all_X_data, axis=0)
-    true_coupling = np.concatenate(all_true_coupling, axis=0)
+    print("\n=== Calculating Climate Metrics for Batch ===")
     
-    # 텐서로 변환
-    X_tensor = torch.from_numpy(X_data).float()
-    true_coupling_tensor = torch.from_numpy(true_coupling).float()
+    try:
+        climate_metrics = ClimateMetrics()
+        
+        # 배치 데이터를 numpy 배열로 변환하고 형태 맞추기
+        batch_size = len(predicted_X_data)
+        m_delta_t = len(predicted_X_data[0])
+        
+        # 예측 데이터를 텐서로 변환
+        predicted_X_tensor = torch.stack(predicted_X_data).detach().numpy()  # [batch_size, time_steps, K]
+        predicted_Y_tensor = torch.stack(predicted_Y_data).detach().numpy()  # [batch_size, time_steps, K*J]
+        
+        # 실제 데이터를 numpy로 변환
+        X_true_np = batch_X_true.detach().numpy()  # [batch_size, time_steps, K]
+        Y_true_np = batch_Y_true.detach().numpy()  # [batch_size, time_steps, K*J]
+        
+        # 각 배치에 대해 climate metrics 계산
+        all_metrics = []
+        
+        for i in range(batch_size):
+            # X 변수에 대한 metrics 계산
+            X_pred_sample = predicted_X_tensor[i]  # [time_steps, K]
+            X_true_sample = X_true_np[i]          # [time_steps, K]
+            
+            # Y 변수에 대한 metrics 계산 (첫 번째 그룹만 사용하여 차원 맞추기)
+            Y_pred_sample = predicted_Y_tensor[i, :, :8]  # [time_steps, 8] (첫 번째 X에 대응하는 Y들)
+            Y_true_sample = Y_true_np[i, :, :8]          # [time_steps, 8]
+            
+            # X 변수 metrics
+            X_metrics = climate_metrics.calculate_all_metrics(X_pred_sample, X_true_sample, dt=dt)
+            
+            # Y 변수 metrics
+            Y_metrics = climate_metrics.calculate_all_metrics(Y_pred_sample, Y_true_sample, dt=dt)
+            
+            # 통합 metrics
+            combined_metrics = {
+                'X_metrics': X_metrics,
+                'Y_metrics': Y_metrics,
+                'batch_index': i
+            }
+            all_metrics.append(combined_metrics)
+        
+        # 전체 배치에 대한 평균 metrics 계산
+        avg_X_metrics = {}
+        avg_Y_metrics = {}
+        
+        # X metrics 평균
+        for key in all_metrics[0]['X_metrics'].keys():
+            if isinstance(all_metrics[0]['X_metrics'][key], (int, float)):
+                values = [m['X_metrics'][key] for m in all_metrics if m['X_metrics'][key] is not None]
+                if values:
+                    avg_X_metrics[key] = np.mean(values)
+        
+        # Y metrics 평균
+        for key in all_metrics[0]['Y_metrics'].keys():
+            if isinstance(all_metrics[0]['Y_metrics'][key], (int, float)):
+                values = [m['Y_metrics'][key] for m in all_metrics if m['Y_metrics'][key] is not None]
+                if values:
+                    avg_Y_metrics[key] = np.mean(values)
+        
+        # 결과 출력
+        print("\n--- AVERAGE CLIMATE METRICS (X variables) ---")
+        climate_metrics.print_metrics_summary(avg_X_metrics)
+        
+        print("\n--- AVERAGE CLIMATE METRICS (Y variables) ---")
+        climate_metrics.print_metrics_summary(avg_Y_metrics)
+        
+        # 결과 저장
+        results = {
+            'individual_metrics': all_metrics,
+            'average_X_metrics': avg_X_metrics,
+            'average_Y_metrics': avg_Y_metrics,
+            'batch_size': batch_size,
+            'time_steps': m_delta_t
+        }
+        
+        print(f"\nClimate metrics calculated for {batch_size} batches with {m_delta_t} time steps")
+        return results
+        
+    except Exception as e:
+        print(f"Error calculating climate metrics: {e}")
+        return None
+
+
+def evaluate_model_performance_with_climate_metrics(model, test_data, num_test_samples=10, dt=0.005):
+    """
+    학습된 모델의 성능을 climate metrics를 포함하여 평가하는 함수
     
-    # 배치 차원 제거 (필요한 경우)
-    if X_tensor.dim() > 2:
-        X_tensor = X_tensor.reshape(-1, X_tensor.shape[-1])
-        true_coupling_tensor = true_coupling_tensor.reshape(-1, true_coupling_tensor.shape[-1])
+    Args:
+        model: 학습된 NeuralLorenz96 모델
+        test_data: 테스트 데이터 리스트
+        num_test_samples: 테스트할 샘플 수
+        dt: 시간 간격
+        
+    Returns:
+        dict: 평가 결과
+    """
+    if not CLIMATE_METRICS_AVAILABLE:
+        print("ClimateMetrics not available. Skipping evaluation.")
+        return None
     
-    # 예측된 커플링 항 계산
+    print(f"\n=== Model Performance Evaluation with Climate Metrics ===")
+    print(f"Testing on {num_test_samples} samples...")
+    
+    model.eval()
+    all_test_metrics = []
+    
     with torch.no_grad():
-        predicted_coupling_tensor = model.subgrid_nn(X_tensor)
+        for i in range(min(num_test_samples, len(test_data))):
+            print(f"\n--- Test Sample {i+1}/{num_test_samples} ---")
+            
+            # 테스트 데이터 로드
+            X_data = test_data[i][0]  # [1, time_steps, K]
+            Y_data = test_data[i][1]  # [1, time_steps, K*J]
+            C_data = test_data[i][2]  # [1, time_steps, K]
+            
+            # 예측
+            predicted_X, predicted_Y = model.integrate_L96_2t_with_neural_coupling(
+                X_data, Y_data, F, h, b, c, dt=dt, neural_coupling=C_data
+            )
+            
+            # Climate metrics 계산
+            sample_metrics = calculate_climate_metrics_for_batch(
+                X_data, Y_data, [predicted_X], [predicted_Y], dt=dt
+            )
+            
+            if sample_metrics:
+                all_test_metrics.append(sample_metrics)
     
-    # NumPy 배열로 변환
-    true_coupling_np = true_coupling_tensor.numpy()
-    predicted_coupling_np = predicted_coupling_tensor.numpy()
-    
-    # 차이 계산
-    difference = true_coupling_np - predicted_coupling_np
-    
-    
-    # 시각화 1: 커플링 항 비교
-    fig1, axes = plt.subplots(3, 1, figsize=(10, 12))
-    
-    # 컬러맵 설정
-    cmap1 = plt.cm.viridis
-    cmap2 = plt.cm.coolwarm
-    
-    # 실제 커플링 항 (S)
-    im1 = axes[0].imshow(true_coupling_np.T, aspect='auto', cmap=cmap1, 
-                         interpolation='none', origin='lower')
-    axes[0].set_ylabel('$S$')
-    axes[0].set_title('True Coupling Term')
-    plt.colorbar(im1, ax=axes[0])
-    
-    # 예측된 커플링 항 (S_θ)
-    im2 = axes[1].imshow(predicted_coupling_np.T, aspect='auto', cmap=cmap1, 
-                         interpolation='none', origin='lower')
-    axes[1].set_ylabel('$S_\\theta$')
-    axes[1].set_title('Predicted Coupling Term (Neural Network)')
-    plt.colorbar(im2, ax=axes[1])
-    
-    # 차이 (S - S_θ)
-    # 차이의 최대 절대값을 기준으로 컬러맵 범위 설정
-    max_diff = max(abs(difference.min()), abs(difference.max()))
-    im3 = axes[2].imshow(difference.T, aspect='auto', cmap=cmap2, 
-                         interpolation='none', origin='lower',
-                         vmin=-max_diff, vmax=max_diff)
-    axes[2].set_xlabel('Time')
-    axes[2].set_ylabel('$S - S_\\theta$')
-    axes[2].set_title(f'Difference')
-    plt.colorbar(im3, ax=axes[2])
-    
-    plt.tight_layout()
-    
-    # 그래프 저장
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    
-    # 시각화 2: 차이값의 분포도
-    fig2, axes2 = plt.subplots(figsize=(10, 10))
-    
-    # 차이값 히스토그램 및 KDE
-    sns.histplot(difference.flatten(), kde=True, ax=axes2, color='blue', bins=100)
-    axes2.set_title('Distribution of Differences (S - S_θ)')
-    axes2.set_xlabel('Difference Value')
-    axes2.set_ylabel('Frequency')
-       
-    plt.tight_layout()
-    
-    # 분포도 그래프 저장
-    if save_path:
-        distribution_save_path = save_path.replace('.png', '_distribution.png')
-        plt.savefig(distribution_save_path, dpi=300, bbox_inches='tight')
-    
-    plt.show()
-    
-    print(f"차이값 통계:")
-    print(f"  최소값: {difference.min():.4f}")
-    print(f"  최대값: {difference.max():.4f}")
-    print(f"  평균: {difference.mean():.4f}")
-    print(f"  표준편차: {difference.std():.4f}")
+    # 전체 테스트 결과 요약
+    if all_test_metrics:
+        print(f"\n=== FINAL TEST RESULTS SUMMARY ===")
+        print(f"Successfully evaluated {len(all_test_metrics)} test samples")
         
-    return fig1, fig2
+        # X 변수에 대한 전체 평균 metrics
+        all_X_metrics = [m['average_X_metrics'] for m in all_test_metrics]
+        final_X_metrics = {}
+        
+        for key in all_X_metrics[0].keys():
+            values = [m[key] for m in all_X_metrics if key in m and m[key] is not None]
+            if values:
+                final_X_metrics[key] = np.mean(values)
+        
+        print("\n--- FINAL AVERAGE CLIMATE METRICS (X variables) ---")
+        climate_metrics = ClimateMetrics()
+        climate_metrics.print_metrics_summary(final_X_metrics)
+        
+        return {
+            'test_samples': all_test_metrics,
+            'final_X_metrics': final_X_metrics,
+            'num_test_samples': len(all_test_metrics)
+        }
     
+    return None
 
-def plot_hovmoller_diagram(model_path, data_dir, batch_idx=1, save_path=None):
+
+def plot_climate_metrics_comparison(metrics_results, save_path=None):
     """
-    Lorenz 96 모델의 느린 변수(X)에 대한 Hovmöller 다이어그램을 생성하는 함수
+    Climate metrics 결과를 시각화하는 함수
     
     Args:
-        model_path: 학습된 모델 경로
-        data_dir: 테스트 데이터가 저장된 디렉토리
-        batch_idx: 사용할 배치 인덱스
-        save_path: 그래프 저장 경로 (None인 경우 저장하지 않음)
-    
-    Returns:
-        fig: 생성된 그래프 객체
+        metrics_results: calculate_climate_metrics_for_batch의 결과
+        save_path: 저장할 파일 경로
     """
-    # 모델 로드
-    subgrid_nn = SubgridNN()
-    model = NeuralLorenz96(subgrid_nn)
-    model.load_state_dict(torch.load(model_path))
-    model.eval()  # 평가 모드로 설정
+    if not CLIMATE_METRICS_AVAILABLE or metrics_results is None:
+        print("Cannot plot climate metrics - data not available")
+        return
     
-    # 파라미터 설정
-    K = 36  # 느린 변수(X)의 수
-    F = 20  # 외부 강제력
-    h = 1.0  # 커플링 계수
-    b = 10   # 진폭 비율
-    c = 10   # 시간 스케일 비율
-    dt = 0.005  # 기본 시간 간격
-
-    large_dt = 10*dt
-
-    # 데이터 로드
-    X_data = np.load(os.path.join(data_dir, f"X_batch_coupled_{batch_idx}.npy"))
-    Y_data = np.load(os.path.join(data_dir, f"Y_batch_coupled_{batch_idx}.npy"))
-    C_data = np.load(os.path.join(data_dir, f"C_batch_coupled_{batch_idx}.npy"))
-
-    X_data = torch.from_numpy(X_data).float()
-    Y_data = torch.from_numpy(Y_data).float()
-    C_data = torch.from_numpy(C_data).float()
-    
-    # 입력 텐서의 shape이 [batch_size, timestep, features]인 경우 [timestep, features]로 차원 축소
-    if len(X_data.shape) > 2:  # 3차원 텐서인 경우
-        X_data = X_data[0]
-        Y_data = Y_data[0]
-        C_data = C_data[0]
-
-    predicted_X, _ = model.integrate_L96_2t_with_neural_coupling(
-        X_data,
-        Y_data,
-        F,
-        h,
-        b,
-        c,
-        dt=large_dt,
-        neural_coupling=model.subgrid_nn(X_data)
-    )
-    
-    # 10dt로 적분된 predicted_X에서 200 인덱스까지만 슬라이싱(=2000개의 데이터 포인트)
-    predicted_X = predicted_X.detach().numpy()
-    
-    predicted_X = predicted_X[:200]
-
-    # X_data에서 10 인덱스 간격으로 샘플링한 데이터 포인트 추출
-    X_data_sampled = X_data[::10][:200]
-
-    # 예측값과 샘플링된 실제 데이터의 차이 계산
-    diff_X = X_data_sampled - predicted_X
-    
-    # 논문과 같은 스타일로 Hovmöller 다이어그램 생성
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-    
-    # 컬러맵 설정
-    cmap1 = plt.cm.viridis  # 상단 및 중간 패널용
-    cmap2 = plt.cm.coolwarm  # 하단 패널용
+    try:
+        climate_metrics = ClimateMetrics()
         
-    # 실제 X 값 (True X)
-    im1 = axes[0].imshow(X_data.T, aspect='auto', cmap=cmap1, 
-                         interpolation='none', origin='lower',
-                         extent=[0, 10, 0, K], vmin=-10, vmax=10)
-    axes[0].set_ylabel('True X')
-    fig.colorbar(im1, ax=axes[0], orientation='vertical', pad=0.01)
-    
-    # 예측된 X 값 (Pred X̂)
-    im2 = axes[1].imshow(predicted_X.T, aspect='auto', cmap=cmap1, 
-                         interpolation='none', origin='lower',
-                         extent=[0, 10, 0, K], vmin=-10, vmax=10)
-    axes[1].set_ylabel('Pred X̂')
-    fig.colorbar(im2, ax=axes[1], orientation='vertical', pad=0.01)
-    
-    # 차이 (X - X̂)
-    # 차이의 최대 절대값을 기준으로 컬러맵 범위 설정
-    max_diff = 20  # 논문과 같은 스케일 사용
-    im3 = axes[2].imshow(diff_X.T, aspect='auto', cmap=cmap2, 
-                         interpolation='none', origin='lower',
-                         extent=[0, 10, 0, K],
-                         vmin=-max_diff, vmax=max_diff)
-    axes[2].set_xlabel('Time')
-    axes[2].set_ylabel('X - X̂')
-    fig.colorbar(im3, ax=axes[2], orientation='vertical', pad=0.01)
-    
-    # 레이아웃 조정
-    plt.tight_layout()
-    
-    # 그래프 저장
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    
-    plt.show()
-    
-    return fig
+        # X 변수 metrics 시각화
+        if 'average_X_metrics' in metrics_results:
+            X_metrics = metrics_results['average_X_metrics']
+            if 'autocorr_lags_pred' in X_metrics and 'autocorr_values_pred' in X_metrics:
+                # Autocorrelation 비교
+                plt.figure(figsize=(15, 5))
+                
+                plt.subplot(1, 3, 1)
+                plt.plot(X_metrics['autocorr_lags_pred'], X_metrics['autocorr_values_pred'], 'r--', label='Prediction', linewidth=2)
+                plt.plot(X_metrics['autocorr_lags_true'], X_metrics['autocorr_values_true'], 'b-', label='True', linewidth=2)
+                plt.title('Autocorrelation Function (X variables)')
+                plt.xlabel('Lag')
+                plt.ylabel('Autocorrelation')
+                plt.legend()
+                plt.grid(True)
+                
+                # PDF 비교
+                plt.subplot(1, 3, 2)
+                plt.plot(X_metrics['pdf_bins_pred'], X_metrics['pdf_values_pred'], 'r--', label='Prediction', linewidth=2)
+                plt.plot(X_metrics['pdf_bins_true'], X_metrics['pdf_values_true'], 'b-', label='True', linewidth=2)
+                plt.title('Probability Density Function (X variables)')
+                plt.xlabel('Value')
+                plt.ylabel('Probability density')
+                plt.legend()
+                plt.grid(True)
+                
+                # Mean State Error over time
+                plt.subplot(1, 3, 3)
+                plt.plot(X_metrics['mean_state_error'], 'g-', linewidth=2)
+                plt.title('Mean State Error Over Time (X variables)')
+                plt.xlabel('Time step')
+                plt.ylabel('Error')
+                plt.grid(True)
+                
+                plt.tight_layout()
+                
+                if save_path:
+                    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                    print(f"Climate metrics comparison plot saved to {save_path}")
+                
+                plt.show()
+        
+    except Exception as e:
+        print(f"Error plotting climate metrics: {e}")
+
 
 
 if __name__ == "__main__":
@@ -437,7 +455,7 @@ if __name__ == "__main__":
 
     # 데이터 로드
     data_list = []
-    for i in range(1, 301):
+    for i in range(1, 251):
         X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_coupled_{i}.npy"))
         Y_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"Y_batch_coupled_{i}.npy"))
         C_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"C_batch_coupled_{i}.npy"))
@@ -497,6 +515,7 @@ if __name__ == "__main__":
         # 학습 과정 출력
         print(f"Epoch {n+1}/{num_epoch}, Loss: {loss.item()}")
         losses.append(loss.item())
+        
     # 학습된 모델 저장
     os.makedirs(os.path.join(os.getcwd(), "baseline_models"), exist_ok=True)
     torch.save(model.state_dict(), os.path.join(os.getcwd(), "baseline_models", "subgrid_nn.pth"))   
@@ -506,19 +525,30 @@ if __name__ == "__main__":
     plt.savefig(os.path.join(os.getcwd(), "baseline_models", "loss.png"))
     plt.show()
     
-    # 모델 및 데이터 경로 설정
-    model_path = os.path.join(os.getcwd(), "baseline_models", "subgrid_nn.pth")
-    data_dir = os.path.join(os.getcwd(), "simulated_data")
-    
-    # 랜덤하게 1개의 배치 선택
-    batch_indices = np.random.choice(range(1, 301), size=1, replace=False)[0]
-    save_path = os.path.join(os.getcwd(), f"coupling_comparison_{i}.png")
-        # 커플링 항 비교 및 시각화
-    compare_coupling_terms(model_path, data_dir, batch_indices=[i], 
-                        time_steps=2000, save_path=save_path)
-
-    # 10 MTU 단위로 Slow variable 예측 후 차이 시각화
-    save_path = os.path.join(os.getcwd(), f"hovmoller_diagram_{i}.png")
-
-    # Hovmöller 다이어그램 생성
-    plot_hovmoller_diagram(model_path, data_dir, batch_idx=i, save_path=save_path)
+    # 최종 모델 성능 평가 (climate metrics 포함)
+    print("\n=== Final Model Performance Evaluation ===")
+    try:
+        # 테스트 데이터 준비 (학습에 사용하지 않은 데이터)
+        test_data = data_list[251:301]  # 마지막 50개를 테스트용으로 사용
+        
+        final_evaluation = evaluate_model_performance_with_climate_metrics(
+            model, test_data, num_test_samples=10, dt=0.005
+        )
+        
+        if final_evaluation:
+            # 최종 결과 시각화
+            final_plot_path = os.path.join(os.getcwd(), "baseline_models", "final_climate_metrics.png")
+            plot_climate_metrics_comparison(
+                {'average_X_metrics': final_evaluation['final_X_metrics']}, 
+                save_path=final_plot_path
+            )
+            
+            # 최종 결과 저장
+            final_metrics_path = os.path.join(os.getcwd(), "baseline_models", "final_climate_metrics.pkl")
+            with open(final_metrics_path, 'wb') as f:
+                pickle.dump(final_evaluation, f)
+            print(f"Final evaluation results saved to {final_metrics_path}")
+            
+    except Exception as e:
+        print(f"Error in final evaluation: {e}")
+        print("Training completed without final evaluation")
