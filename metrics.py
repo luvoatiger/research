@@ -40,7 +40,8 @@ class ClimateMetrics:
             u_true = u_true.reshape(-1, 1)
             
         # 각 시간 단계별로 L2 norm 계산
-        error = np.linalg.norm(u_pred - u_true, axis=1) / np.linalg.norm(u_pred, axis=1)
+        error = np.linalg.norm(u_pred - u_true, axis=1) / np.linalg.norm(u_true, axis=1)
+        
         return error
     
     def variance_ratio(self, u_pred, u_true):
@@ -146,7 +147,7 @@ class ClimateMetrics:
         Args:
             trajectory (np.ndarray): 시계열 데이터 [time_steps, variables]
             dt (float): 시간 간격
-            method (str): 계산 방법 ('linear_fit' 또는 'wolf')
+            method (str): 계산 방법 ('linear_fit', 'wolf', 'rosenstein', 'kantz')
             max_lag (int): 최대 지연 시간 (None인 경우 전체 길이의 1/10)
             
         Returns:
@@ -164,8 +165,12 @@ class ClimateMetrics:
             return self._lyapunov_linear_fit(trajectory, dt, max_lag)
         elif method == 'wolf':
             return self._lyapunov_wolf_method(trajectory, dt, max_lag)
+        elif method == 'rosenstein':
+            return self._lyapunov_rosenstein_method(trajectory, dt, max_lag)
+        elif method == 'kantz':
+            return self._lyapunov_kantz_method(trajectory, dt, max_lag)
         else:
-            raise ValueError("method must be 'linear_fit' or 'wolf'")
+            raise ValueError("method must be 'linear_fit', 'wolf', 'rosenstein', or 'kantz'")
     
     def _lyapunov_linear_fit(self, trajectory, dt, max_lag):
         """선형 피팅을 사용한 Lyapunov 지수 계산"""
@@ -201,44 +206,56 @@ class ClimateMetrics:
         uncertainty = np.std(residuals)
         
         # Lyapunov 시간 계산
-        lyapunov_time = 1.0 / abs(lyapunov_exp) if lyapunov_exp != 0 else np.inf
+        lyapunov_time_result = self.calculate_lyapunov_time(lyapunov_exp)
+        lyapunov_time = lyapunov_time_result['lyapunov_time']
         
         return lyapunov_exp, lyapunov_time, uncertainty
     
     def _lyapunov_wolf_method(self, trajectory, dt, max_lag):
-        """Wolf 방법을 사용한 Lyapunov 지수 계산"""
+        """Wolf 방법을 사용한 Lyapunov 지수 계산
+        
+        실제 Wolf 방법: Jacobian 행렬을 사용하여 분리 벡터의 진화를 추적
+        """
         n_steps, n_vars = trajectory.shape
         
-        # 초기 분리 벡터
+        # 초기 분리 벡터 설정
         epsilon = 1e-6
         initial_separation = epsilon * np.random.randn(n_vars)
         
         # 분리 벡터의 진화 추적
-        separation_vectors = []
         separation_norms = []
+        times = []
         
         current_separation = initial_separation.copy()
         
         for i in range(min(max_lag, n_steps-1)):
-            # 현재 상태에서의 분리 벡터
+            # 현재 상태에서의 분리 벡터 크기
             separation_norms.append(np.linalg.norm(current_separation))
+            times.append(i * dt)
             
-            # 다음 상태로의 분리 벡터 업데이트 (간단한 근사)
             if i < n_steps - 1:
-                # 실제로는 Jacobian을 계산해야 하지만, 여기서는 간단한 근사 사용
-                current_separation = current_separation * (1 + 0.1 * np.random.randn())
+                # Jacobian 행렬 근사 (유한 차분 사용)
+                jacobian = self._approximate_jacobian(trajectory[i], trajectory[i+1], dt)
                 
-                # 정규화 (너무 커지거나 작아지는 것을 방지)
-                if np.linalg.norm(current_separation) > 1.0:
-                    current_separation = current_separation / np.linalg.norm(current_separation) * epsilon
+                # 분리 벡터 업데이트: δx(t+1) = J(t) * δx(t)
+                current_separation = jacobian @ current_separation
+                
+                # 정규화: 너무 커지거나 작아지는 것을 방지
+                norm_sep = np.linalg.norm(current_separation)
+                if norm_sep > 1.0:
+                    current_separation = current_separation / norm_sep * epsilon
+                elif norm_sep < epsilon * 1e-3:
+                    # 너무 작아지면 새로운 방향으로 재시작
+                    current_separation = epsilon * np.random.randn(n_vars)
         
         if len(separation_norms) < 10:
             return 0.0, np.inf, 0.0
             
         # 로그 분리 vs 시간의 선형 피팅
         log_separations = np.log(separation_norms)
-        times = np.arange(len(separation_norms)) * dt
+        times = np.array(times)
         
+        # 선형 회귀
         coeffs = np.polyfit(times, log_separations, 1)
         lyapunov_exp = coeffs[0]
         
@@ -247,18 +264,367 @@ class ClimateMetrics:
         uncertainty = np.std(residuals)
         
         # Lyapunov 시간 계산
-        lyapunov_time = 1.0 / abs(lyapunov_exp) if lyapunov_exp != 0 else np.inf
+        lyapunov_time_result = self.calculate_lyapunov_time(lyapunov_exp)
+        lyapunov_time = lyapunov_time_result['lyapunov_time']
         
         return lyapunov_exp, lyapunov_time, uncertainty
     
-    def calculate_autocorrelation(self, data, max_lag=None, normalize=True):
+    def _approximate_jacobian(self, x_t, x_tp1, dt):
+        """유한 차분을 사용한 Jacobian 행렬 근사"""
+        n_vars = len(x_t)
+        jacobian = np.zeros((n_vars, n_vars))
+        
+        # 각 변수에 대한 편미분 계산
+        for i in range(n_vars):
+            # i번째 변수에 작은 변화 추가
+            x_perturbed = x_t.copy()
+            x_perturbed[i] += 1e-8
+            
+            # 변화된 상태에서의 미분 계산
+            # dx/dt ≈ (x(t+1) - x(t)) / dt
+            # ∂f_i/∂x_j ≈ (f_i(x+δx_j) - f_i(x)) / δx_j
+            # 여기서는 간단한 근사 사용
+            jacobian[:, i] = (x_tp1 - x_t) / dt
+        
+        return jacobian
+    
+    def _lyapunov_rosenstein_method(self, trajectory, dt, max_lag, min_neighbors=10):
+        """Rosenstein 방법을 사용한 Lyapunov 지수 계산
+        
+        Rosenstein 방법: 최근접 이웃을 사용하여 지연 좌표에서의 분리 진화를 추적
+        """
+        n_steps, n_vars = trajectory.shape
+        
+        # 지연 좌표 구성 (간단한 1차 지연)
+        delay = 1
+        embedded_dim = min(3, n_vars)  # 임베딩 차원
+        
+        # 지연 좌표 데이터 구성
+        embedded_data = []
+        for i in range(n_steps - delay * (embedded_dim - 1)):
+            point = []
+            for j in range(embedded_dim):
+                point.extend(trajectory[i + j * delay])
+            embedded_data.append(point)
+        
+        embedded_data = np.array(embedded_data)
+        n_embedded = len(embedded_data)
+        
+        if n_embedded < min_neighbors + 10:
+            return 0.0, np.inf, 0.0
+        
+        # 각 점에 대해 최근접 이웃 찾기
+        separations = []
+        times = []
+        
+        for i in range(min(max_lag, n_embedded - 1)):
+            current_point = embedded_data[i]
+            
+            # 현재 점과의 거리 계산
+            distances = np.linalg.norm(embedded_data - current_point, axis=1)
+            
+            # 자기 자신과 너무 가까운 점들 제외
+            valid_indices = np.where(distances > 1e-10)[0]
+            if len(valid_indices) < min_neighbors:
+                continue
+                
+            # 최근접 이웃 찾기
+            nearest_idx = valid_indices[np.argmin(distances[valid_indices])]
+            
+            # 시간에 따른 분리 추적
+            if nearest_idx + i < n_embedded:
+                separation = np.linalg.norm(embedded_data[nearest_idx + i] - embedded_data[i])
+                if separation > 1e-10:
+                    separations.append(separation)
+                    times.append(i * dt)
+        
+        if len(separations) < 10:
+            return 0.0, np.inf, 0.0
+            
+        # 로그 분리 vs 시간의 선형 피팅
+        log_separations = np.log(separations)
+        times = np.array(times)
+        
+        # 선형 회귀
+        coeffs = np.polyfit(times, log_separations, 1)
+        lyapunov_exp = coeffs[0]
+        
+        # 불확실성 계산
+        residuals = log_separations - (coeffs[0] * times + coeffs[1])
+        uncertainty = np.std(residuals)
+        
+        # Lyapunov 시간 계산
+        lyapunov_time_result = self.calculate_lyapunov_time(lyapunov_exp)
+        lyapunov_time = lyapunov_time_result['lyapunov_time']
+        
+        return lyapunov_exp, lyapunov_time, uncertainty
+    
+    def _lyapunov_kantz_method(self, trajectory, dt, max_lag, min_neighbors=10, epsilon=1e-6):
+        """Kantz 방법을 사용한 Lyapunov 지수 계산
+        
+        Kantz 방법: 각 점 주변의 이웃들을 사용하여 지역적 Lyapunov 지수를 계산
+        """
+        n_steps, n_vars = trajectory.shape
+        
+        # 지연 좌표 구성
+        delay = 1
+        embedded_dim = min(3, n_vars)
+        
+        # 지연 좌표 데이터 구성
+        embedded_data = []
+        for i in range(n_steps - delay * (embedded_dim - 1)):
+            point = []
+            for j in range(embedded_dim):
+                point.extend(trajectory[i + j * delay])
+            embedded_data.append(point)
+        
+        embedded_data = np.array(embedded_data)
+        n_embedded = len(embedded_data)
+        
+        if n_embedded < min_neighbors + 10:
+            return 0.0, np.inf, 0.0
+        
+        # 각 점에 대해 지역적 Lyapunov 지수 계산
+        local_lyapunovs = []
+        times = []
+        
+        for i in range(min(max_lag, n_embedded - 1)):
+            current_point = embedded_data[i]
+            
+            # 현재 점과의 거리 계산
+            distances = np.linalg.norm(embedded_data - current_point, axis=1)
+            
+            # ε-이웃 찾기 (너무 가까운 점들 제외)
+            neighbor_mask = (distances > epsilon) & (distances < 2 * epsilon)
+            neighbor_indices = np.where(neighbor_mask)[0]
+            
+            if len(neighbor_indices) < min_neighbors:
+                continue
+            
+            # 이웃들과의 분리 진화 추적
+            local_separations = []
+            
+            for neighbor_idx in neighbor_indices:
+                if neighbor_idx + i < n_embedded:
+                    initial_sep = distances[neighbor_idx]
+                    final_sep = np.linalg.norm(embedded_data[neighbor_idx + i] - embedded_data[i])
+                    
+                    if initial_sep > 1e-10 and final_sep > 1e-10:
+                        local_sep = np.log(final_sep / initial_sep) / (i * dt)
+                        local_separations.append(local_sep)
+            
+            if len(local_separations) > 0:
+                # 지역적 Lyapunov 지수의 평균
+                local_lyap = np.mean(local_separations)
+                local_lyapunovs.append(local_lyap)
+                times.append(i * dt)
+        
+        if len(local_lyapunovs) < 10:
+            return 0.0, np.inf, 0.0
+            
+        # 전체 Lyapunov 지수 (지역적 값들의 평균)
+        lyapunov_exp = np.mean(local_lyapunovs)
+        
+        # 불확실성 계산
+        uncertainty = np.std(local_lyapunovs)
+        
+        # Lyapunov 시간 계산
+        lyapunov_time_result = self.calculate_lyapunov_time(lyapunov_exp)
+        lyapunov_time = lyapunov_time_result['lyapunov_time']
+        
+        return lyapunov_exp, lyapunov_time, uncertainty
+    
+    def compare_lyapunov_methods(self, trajectory, dt, max_lag=None):
+        """
+        모든 Lyapunov 지수 계산 방법을 비교
+        
+        Args:
+            trajectory (np.ndarray): 시계열 데이터 [time_steps, variables]
+            dt (float): 시간 간격
+            max_lag (int): 최대 지연 시간
+            
+        Returns:
+            dict: 각 방법별 결과를 포함한 딕셔너리
+        """
+        methods = ['linear_fit', 'wolf', 'rosenstein', 'kantz']
+        results = {}
+        
+        for method in methods:
+            try:
+                lyap_exp, lyap_time, uncertainty = self.calculate_lyapunov_exponent(
+                    trajectory, dt, method=method, max_lag=max_lag
+                )
+                results[method] = {
+                    'lyapunov_exponent': lyap_exp,
+                    'lyapunov_time': lyap_time,
+                    'uncertainty': uncertainty
+                }
+            except Exception as e:
+                results[method] = {
+                    'lyapunov_exponent': None,
+                    'lyapunov_time': None,
+                    'uncertainty': None,
+                    'error': str(e)
+                }
+        
+        return results
+    
+    def calculate_lyapunov_time(self, lyapunov_exponent, method='direct', uncertainty=None):
+        """
+        Lyapunov Time 계산
+        
+        Lyapunov Time은 시스템의 예측 가능성을 나타내는 시간 척도입니다.
+        λ > 0인 경우: 시스템이 카오틱하며, 초기 조건의 작은 오차가 지수적으로 증폭됩니다.
+        λ < 0인 경우: 시스템이 안정적이며, 초기 조건의 오차가 감소합니다.
+        
+        Args:
+            lyapunov_exponent (float): Lyapunov 지수
+            method (str): 계산 방법 ('direct', 'confidence_interval', 'bootstrap')
+            uncertainty (float): Lyapunov 지수의 불확실성 (표준편차)
+            
+        Returns:
+            dict: Lyapunov Time과 관련 정보를 포함한 딕셔너리
+        """
+        if lyapunov_exponent == 0:
+            return {
+                'lyapunov_time': np.inf,
+                'prediction_horizon': np.inf,
+                'stability': 'neutral',
+                'confidence_interval': None,
+                'method': method
+            }
+        
+        # 기본 Lyapunov Time 계산: τ = 1/|λ|
+        lyapunov_time = 1.0 / abs(lyapunov_exponent)
+        
+        # 시스템의 안정성 판정
+        if lyapunov_exponent > 0:
+            stability = 'chaotic'
+            prediction_horizon = lyapunov_time
+        else:
+            stability = 'stable'
+            prediction_horizon = np.inf
+        
+        result = {
+            'lyapunov_time': lyapunov_time,
+            'prediction_horizon': prediction_horizon,
+            'stability': stability,
+            'lyapunov_exponent': lyapunov_exponent,
+            'method': method
+        }
+        
+        # 불확실성이 주어진 경우 신뢰구간 계산
+        if uncertainty is not None and method in ['confidence_interval', 'bootstrap']:
+            if method == 'confidence_interval':
+                # 95% 신뢰구간 계산 (정규분포 가정)
+                z_score = 1.96  # 95% 신뢰수준
+                
+                # Lyapunov 지수의 신뢰구간
+                lambda_lower = lyapunov_exponent - z_score * uncertainty
+                lambda_upper = lyapunov_exponent + z_score * uncertainty
+                
+                # Lyapunov Time의 신뢰구간
+                if lambda_lower > 0:
+                    tau_upper = 1.0 / lambda_lower
+                else:
+                    tau_upper = np.inf
+                    
+                if lambda_upper > 0:
+                    tau_lower = 1.0 / lambda_upper
+                else:
+                    tau_lower = 0.0
+                
+                result['confidence_interval'] = {
+                    'lambda': (lambda_lower, lambda_upper),
+                    'lyapunov_time': (tau_lower, tau_upper),
+                    'confidence_level': 0.95
+                }
+                
+            elif method == 'bootstrap':
+                # Bootstrap 방법으로 신뢰구간 계산
+                n_bootstrap = 1000
+                bootstrap_times = []
+                
+                for _ in range(n_bootstrap):
+                    # 정규분포를 가정한 부트스트랩 샘플
+                    lambda_boot = np.random.normal(lyapunov_exponent, uncertainty)
+                    if lambda_boot != 0:
+                        tau_boot = 1.0 / abs(lambda_boot)
+                        bootstrap_times.append(tau_boot)
+                
+                if bootstrap_times:
+                    bootstrap_times = np.array(bootstrap_times)
+                    # 95% 신뢰구간 (2.5%와 97.5% 백분위수)
+                    tau_lower = np.percentile(bootstrap_times, 2.5)
+                    tau_upper = np.percentile(bootstrap_times, 97.5)
+                    
+                    result['confidence_interval'] = {
+                        'lyapunov_time': (tau_lower, tau_upper),
+                        'bootstrap_samples': n_bootstrap,
+                        'confidence_level': 0.95
+                    }
+        
+        return result
+    
+    def analyze_prediction_horizon(self, trajectory, dt, methods=None, max_lag=None):
+        """
+        여러 방법을 사용하여 예측 가능 시간 분석
+        
+        Args:
+            trajectory (np.ndarray): 시계열 데이터
+            dt (float): 시간 간격
+            methods (list): 사용할 Lyapunov 지수 계산 방법들
+            max_lag (int): 최대 지연 시간
+            
+        Returns:
+            dict: 각 방법별 예측 가능 시간 분석 결과
+        """
+        if methods is None:
+            methods = ['linear_fit', 'wolf', 'rosenstein', 'kantz']
+        
+        analysis_results = {}
+        
+        for method in methods:
+            try:
+                # Lyapunov 지수 계산
+                lyap_exp, _, uncertainty = self.calculate_lyapunov_exponent(
+                    trajectory, dt, method=method, max_lag=max_lag
+                )
+                
+                # Lyapunov Time 계산 (신뢰구간 포함)
+                lyap_time_result = self.calculate_lyapunov_time(
+                    lyap_exp, method='confidence_interval', uncertainty=uncertainty
+                )
+                
+                analysis_results[method] = {
+                    'lyapunov_exponent': lyap_exp,
+                    'lyapunov_time': lyap_time_result['lyapunov_time'],
+                    'prediction_horizon': lyap_time_result['prediction_horizon'],
+                    'stability': lyap_time_result['stability'],
+                    'uncertainty': uncertainty,
+                    'confidence_interval': lyap_time_result.get('confidence_interval')
+                }
+                
+            except Exception as e:
+                analysis_results[method] = {
+                    'error': str(e),
+                    'lyapunov_exponent': None,
+                    'lyapunov_time': None,
+                    'prediction_horizon': None,
+                    'stability': None
+                }
+        
+        return analysis_results
+    
+    def calculate_autocorrelation(self, data, max_lag=None, normalize=True, method='statsmodels'):
         """
         자기상관 함수 계산
         
         Args:
             data (np.ndarray): 시계열 데이터 [time_steps, variables] 또는 [time_steps]
             max_lag (int): 최대 지연 시간 (None인 경우 전체 길이의 1/2)
-            normalize (bool): 정규화 여부
+            normalize (bool): 정규화 여부 (statsmodels에서는 항상 정규화됨)
+            method (str): 계산 방법 ('statsmodels', 'scipy', 'manual')
             
         Returns:
             tuple: (lags, autocorr)
@@ -277,11 +643,26 @@ class ClimateMetrics:
         all_autocorr = []
         
         for i in range(n_vars):
-            autocorr = correlate(data[:, i], data[:, i], mode='full')
-            autocorr = autocorr[n_steps-1:n_steps-1+max_lag+1]
+            if method == 'statsmodels':
+                try:
+                    # statsmodels 사용 (권장)
+                    from statsmodels.tsa.stattools import acf
+                    autocorr = acf(data[:, i], nlags=max_lag, fft=True)
+                except ImportError:
+                    print("Warning: statsmodels not available, falling back to scipy method")
+                    method = 'scipy'
             
-            if normalize:
-                autocorr = autocorr / autocorr[0]
+            if method == 'scipy':
+                # scipy.signal.correlate 사용 (기존 방법)
+                autocorr = correlate(data[:, i], data[:, i], mode='full')
+                autocorr = autocorr[n_steps-1:n_steps-1+max_lag+1]
+                
+                if normalize:
+                    autocorr = autocorr / autocorr[0]
+                    
+            elif method == 'manual':
+                # 수동 계산 (교육적 목적)
+                autocorr = self._manual_autocorrelation(data[:, i], max_lag)
                 
             all_autocorr.append(autocorr)
         
@@ -290,6 +671,132 @@ class ClimateMetrics:
         lags = np.arange(len(mean_autocorr))
         
         return lags, mean_autocorr
+    
+    def _manual_autocorrelation(self, data, max_lag):
+        """
+        수동으로 autocorrelation 계산 (교육적 목적)
+        
+        Args:
+            data (np.ndarray): 1차원 시계열 데이터
+            max_lag (int): 최대 지연 시간
+            
+        Returns:
+            np.ndarray: autocorrelation 값들
+        """
+        n_steps = len(data)
+        mean_val = np.mean(data)
+        var_val = np.var(data)
+        
+        autocorr = np.zeros(max_lag + 1)
+        
+        for lag in range(max_lag + 1):
+            if lag == 0:
+                # lag=0: 항상 1.0
+                autocorr[lag] = 1.0
+            else:
+                # lag>0: 시계열 상관계수 계산
+                numerator = 0.0
+                for t in range(n_steps - lag):
+                    numerator += (data[t] - mean_val) * (data[t + lag] - mean_val)
+                
+                autocorr[lag] = numerator / ((n_steps - lag) * var_val)
+        
+        return autocorr
+    
+    def calculate_partial_autocorrelation(self, data, max_lag=None, method='statsmodels'):
+        """
+        부분 자기상관 함수(Partial Autocorrelation Function) 계산
+        
+        Args:
+            data (np.ndarray): 시계열 데이터 [time_steps, variables] 또는 [time_steps]
+            max_lag (int): 최대 지연 시간 (None인 경우 전체 길이의 1/2)
+            method (str): 계산 방법 ('statsmodels', 'manual')
+            
+        Returns:
+            tuple: (lags, pacf)
+        """
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+            
+        n_steps, n_vars = data.shape
+        
+        if max_lag is None:
+            max_lag = n_steps // 2
+            
+        max_lag = min(max_lag, n_steps - 1)
+        
+        # 각 변수별로 부분 자기상관 함수 계산
+        all_pacf = []
+        
+        for i in range(n_vars):
+            if method == 'statsmodels':
+                try:
+                    from statsmodels.tsa.stattools import pacf
+                    pacf_values = pacf(data[:, i], nlags=max_lag, method='ols')
+                    all_pacf.append(pacf_values)
+                except ImportError:
+                    print("Warning: statsmodels not available for PACF calculation")
+                    return None, None
+            else:
+                # 수동 계산 (복잡하므로 statsmodels 권장)
+                print("Manual PACF calculation not implemented. Using statsmodels.")
+                try:
+                    from statsmodels.tsa.stattools import pacf
+                    pacf_values = pacf(data[:, i], nlags=max_lag, method='ols')
+                    all_pacf.append(pacf_values)
+                except ImportError:
+                    return None, None
+        
+        # 평균 부분 자기상관 함수
+        mean_pacf = np.mean(all_pacf, axis=0)
+        lags = np.arange(len(mean_pacf))
+        
+        return lags, mean_pacf
+    
+    def calculate_autocorrelation_confidence_intervals(self, data, max_lag=None, confidence_level=0.95):
+        """
+        Autocorrelation의 신뢰구간 계산
+        
+        Args:
+            data (np.ndarray): 시계열 데이터
+            max_lag (int): 최대 지연 시간
+            confidence_level (float): 신뢰수준 (기본값: 0.95)
+            
+        Returns:
+            dict: 신뢰구간 정보
+        """
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+            
+        n_steps, n_vars = data.shape
+        
+        if max_lag is None:
+            max_lag = n_steps // 2
+            
+        max_lag = min(max_lag, n_steps - 1)
+        
+        # Bartlett's formula를 사용한 신뢰구간 계산
+        # 95% 신뢰구간: ±1.96/√N
+        z_score = 1.96 if confidence_level == 0.95 else 2.58  # 99% 신뢰수준
+        
+        confidence_bound = z_score / np.sqrt(n_steps)
+        
+        # 각 변수별로 autocorrelation 계산
+        lags, autocorr = self.calculate_autocorrelation(data, max_lag, method='statsmodels')
+        
+        if lags is None:
+            return None
+            
+        confidence_intervals = {
+            'lags': lags,
+            'autocorr': autocorr,
+            'upper_bound': confidence_bound,
+            'lower_bound': -confidence_bound,
+            'confidence_level': confidence_level,
+            'sample_size': n_steps
+        }
+        
+        return confidence_intervals
     
     def calculate_pdf(self, data, bins=50, density=True, range_limits=None):
         """

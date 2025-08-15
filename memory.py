@@ -108,66 +108,6 @@ class dAMZ(nn.Module):
         
         return markov_term
 
-    def system_dynamics(self, z_n, Z_in, enable_dropout=True):
-        """
-        시스템의 전체 동역학 계산: dz/dt = markov_term + memory_term
-        
-        Args:
-            z_n (torch.Tensor): 현재 상태 [batch_size, d]
-            Z_in (torch.Tensor): 전체 입력 텐서 [batch_size, D]
-            enable_dropout (bool): Dropout 활성화 여부
-            
-        Returns:
-            torch.Tensor: 전체 미분 [batch_size, d]
-        """
-        markov_term = self.lorenz96_markov_term(z_n)
-        
-        if enable_dropout:
-            self.lstm.train()
-            self.output_layer.train()
-        else:
-            self.lstm.eval()
-            self.output_layer.eval()
-        
-        # LSTM을 위한 입력 재구성: [batch_size, D] -> [batch_size, n_M+1, d]
-        # Z_in은 [batch_size, D] 형태이고, D = d * (n_M + 1)
-        Z_in_reshaped = Z_in.view(Z_in.shape[0], self.n_M + 1, self.d)
-        
-        # LSTM 처리
-        lstm_out, _ = self.lstm(Z_in_reshaped)
-        
-        # 마지막 시점의 출력만 사용 (가장 최근 정보)
-        last_output = lstm_out[:, -1, :]  # [batch_size, hidden_dim]
-        
-        # 최종 출력층을 통한 매핑
-        memory_term = self.output_layer(last_output)
-        
-        return markov_term + memory_term
-
-    def rk4_step(self, z_n, Z_in, enable_dropout=True):
-        """
-        RK4 (Runge-Kutta 4th order) 수치적분을 사용한 한 스텝 진행
-        
-        Args:
-            z_n (torch.Tensor): 현재 상태 [batch_size, d]
-            Z_in (torch.Tensor): 전체 입력 텐서 [batch_size, D]
-            enable_dropout (bool): Dropout 활성화 여부
-            
-        Returns:
-            torch.Tensor: 다음 상태 [batch_size, d]
-        """
-        dt = self.dt
-        
-        # RK4 계수 계산
-        k1 = self.system_dynamics(z_n, Z_in, enable_dropout)
-        k2 = self.system_dynamics(z_n + 0.5 * dt * k1, Z_in, enable_dropout)
-        k3 = self.system_dynamics(z_n + 0.5 * dt * k2, Z_in, enable_dropout)
-        k4 = self.system_dynamics(z_n + dt * k3, Z_in, enable_dropout)
-        
-        # RK4 공식 적용
-        z_next = z_n + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-        
-        return z_next
 
     def forward(self, Z_in, enable_dropout=True):
         """
@@ -1630,16 +1570,19 @@ if __name__ == "__main__":
     
     # 첫 번째 변수만 시각화
     t_end = 10
+    '''
     print("\n--- 첫 번째 변수(X1) 예측 ---")
     simulate_and_plot_lorenz96_x1_prediction(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
-        
+    '''
     # 모든 변수 시각화
     print("\n--- 모든 변수 예측 ---")
     simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
 
+    '''
     # Random IC에 대한 Extrapolation 성능 평가
     print("\n[+] Random IC에 대한 Extrapolation 성능 평가...")
     evaluate_extrapolation_performance(model, metadata, memory_length_TM, num_trials=5, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
+    '''
     '''
     # 불확실성을 포함한 첫 번째 변수 예측
     print("\n--- 첫 번째 변수(X1) 예측 (불확실성 포함) ---")
