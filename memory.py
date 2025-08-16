@@ -11,6 +11,54 @@ import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from metrics import ClimateMetrics
 
+class HistoryBuffer:
+    """
+    상태 히스토리를 저장하고 관리하는 클래스
+    """
+    def __init__(self, memory_length, state_dim):
+        self.memory_length = memory_length
+        self.state_dim = state_dim
+        self.buffer = torch.zeros(memory_length, state_dim)
+        self.ptr = 0
+        
+    def update(self, state):
+        """
+        새로운 상태를 버퍼에 추가
+        
+        Args:
+            state (torch.Tensor): 추가할 상태 [state_dim]
+        """
+        self.buffer[self.ptr] = state
+        self.ptr = (self.ptr + 1) % self.memory_length
+        
+    def get_history(self):
+        """
+        시간 순서대로 히스토리 반환 (가장 최근이 마지막)
+        
+        Returns:
+            torch.Tensor: [memory_length, state_dim] 형태의 히스토리
+        """
+        # 시간 순서대로 반환 (가장 오래된 것이 첫 번째)
+        indices = torch.arange(self.memory_length)
+        indices = (self.ptr - indices - 1) % self.memory_length
+        return self.buffer[indices]
+    
+    def get_latest_history(self):
+        """
+        가장 최근 히스토리부터 순서대로 반환 (가장 최근이 첫 번째)
+        
+        Returns:
+            torch.Tensor: [memory_length, state_dim] 형태의 히스토리
+        """
+        indices = torch.arange(self.memory_length)
+        indices = (self.ptr - indices - 1) % self.memory_length
+        return self.buffer[indices].flip(0)  # 시간 순서를 뒤집어서 반환
+    
+    def reset(self):
+        """버퍼를 초기화"""
+        self.buffer.zero_()
+        self.ptr = 0
+
 class dAMZ(nn.Module):
     """
     d-AMZ (discrete Approximated Mori Zwanzig) 신경망
@@ -493,17 +541,28 @@ def simulate_and_plot_lorenz96_x1_prediction(model, metadata, memory_length_TM, 
         model.eval()
         n_M = int(memory_length_TM / dt)  # 메모리 길이 (일관성을 위해 동일하게 설정)
 
+        # HistoryBuffer 초기화
+        history_buffer = HistoryBuffer(n_M + 1, K)
+        
+        # 초기 히스토리 채우기
+        for i in range(n_M + 1):
+            history_buffer.update(torch.FloatTensor(X_true[i]))
+
         # 메모리 항목들을 포함한 입력 데이터 준비
         x1_pred = []
         with torch.no_grad():
             for i in range(n_M + 1, len(X_true)):
-                # Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
-                Z_input = X_true[i-n_M-1:i].reshape(-1)  # [D]
-                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)  # [1, D]
+                # HistoryBuffer에서 히스토리 가져오기
+                history = history_buffer.get_history()  # [n_M+1, K]
+                Z_input = history.reshape(-1)  # [D]
+                Z_tensor = Z_input.unsqueeze(0)  # [1, D]
 
                 # 예측
                 z_pred = model(Z_tensor, enable_dropout=False)
                 x1_pred.append(z_pred[0, 0].item())  # X1 예측값
+                
+                # 새로운 상태로 히스토리 업데이트
+                history_buffer.update(torch.FloatTensor(z_pred[0]))
 
         print(f"예측 완료: {len(x1_pred)} 개의 예측값")
 
@@ -631,13 +690,25 @@ def simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, memory_
         model.eval()
         n_M = int(memory_length_TM / dt)  # 메모리 길이 (일관성을 위해 동일하게 설정)
 
+        # HistoryBuffer 초기화
+        history_buffer = HistoryBuffer(n_M + 1, K)
+        
+        # 초기 히스토리 채우기
+        for i in range(n_M + 1):
+            history_buffer.update(torch.FloatTensor(X_true[i]))
+
         X_pred = []
         with torch.no_grad():
             for i in range(n_M + 1, len(X_true)):
-                Z_input = X_true[i-n_M-1:i].reshape(-1)
-                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)
+                # HistoryBuffer에서 히스토리 가져오기
+                history = history_buffer.get_history()  # [n_M+1, K]
+                Z_input = history.reshape(-1)  # [D]
+                Z_tensor = Z_input.unsqueeze(0)  # [1, D]
                 z_pred = model(Z_tensor)
                 X_pred.append(z_pred[0].numpy())
+                
+                # 새로운 상태로 히스토리 업데이트
+                history_buffer.update(torch.FloatTensor(z_pred[0]))
 
         X_pred = np.array(X_pred)
         t_pred = t_vals[n_M + 1:]
@@ -768,20 +839,31 @@ def simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, m
         # 모델 예측 (불확실성 포함)
         n_M = int(memory_length_TM / dt)  # 메모리 길이 (일관성을 위해 동일하게 설정)
 
+        # HistoryBuffer 초기화
+        history_buffer = HistoryBuffer(n_M + 1, K)
+        
+        # 초기 히스토리 채우기
+        for i in range(n_M + 1):
+            history_buffer.update(torch.FloatTensor(X_true[i]))
+
         # 메모리 항목들을 포함한 입력 데이터 준비
         x1_pred_mean = []
         x1_pred_std = []
         
         with torch.no_grad():
             for i in range(n_M + 1, len(X_true)):
-                # Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T
-                Z_input = X_true[i-n_M-1:i].reshape(-1)  # [D]
-                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)  # [1, D]
+                # HistoryBuffer에서 히스토리 가져오기
+                history = history_buffer.get_history()  # [n_M+1, K]
+                Z_input = history.reshape(-1)  # [D]
+                Z_tensor = Z_input.unsqueeze(0)  # [1, D]
 
                 # Monte Carlo Dropout을 사용한 불확실성 추정
                 mean_pred, std_pred = model.predict_with_uncertainty(Z_tensor, num_samples=num_mc_samples)
                 x1_pred_mean.append(mean_pred[0, 0].item())  # X1 평균 예측값
                 x1_pred_std.append(std_pred[0, 0].item())    # X1 표준편차
+                
+                # 새로운 상태로 히스토리 업데이트
+                history_buffer.update(torch.FloatTensor(z_pred[0]))
 
         print(f"예측 완료: {len(x1_pred_mean)} 개의 예측값 (Monte Carlo 샘플 수: {num_mc_samples})")
 
@@ -941,18 +1023,30 @@ def simulate_and_plot_lorenz96_all_variables_prediction_with_uncertainty(model, 
         # 모델 예측 (불확실성 포함)
         n_M = int(memory_length_TM / dt)  # 메모리 길이 (일관성을 위해 동일하게 설정)
 
+        # HistoryBuffer 초기화
+        history_buffer = HistoryBuffer(n_M + 1, K)
+        
+        # 초기 히스토리 채우기
+        for i in range(n_M + 1):
+            history_buffer.update(torch.FloatTensor(X_true[i]))
+
         X_pred_mean = []
         X_pred_std = []
         
         with torch.no_grad():
             for i in range(n_M + 1, len(X_true)):
-                Z_input = X_true[i-n_M-1:i].reshape(-1)
-                Z_tensor = torch.FloatTensor(Z_input).unsqueeze(0)
+                # HistoryBuffer에서 히스토리 가져오기
+                history = history_buffer.get_history()  # [n_M+1, K]
+                Z_input = history.reshape(-1)  # [D]
+                Z_tensor = Z_input.unsqueeze(0)  # [1, D]
                 
                 # Monte Carlo Dropout을 사용한 불확실성 추정
                 mean_pred, std_pred = model.predict_with_uncertainty(Z_tensor, num_samples=num_mc_samples)
                 X_pred_mean.append(mean_pred[0].numpy())
                 X_pred_std.append(std_pred[0].numpy())
+                
+                # 새로운 상태로 히스토리 업데이트
+                history_buffer.update(torch.FloatTensor(z_pred[0]))
 
             X_pred_mean = np.array(X_pred_mean)
             X_pred_std = np.array(X_pred_std)
@@ -1460,6 +1554,151 @@ def evaluate_climate_metrics_with_uncertainty(u_true, u_pred_samples, time_axis=
     return metrics
 
 
+def _rollout_k_steps_with_model(model, batch_Z_flat, k_steps):
+    """
+    Hist_Deterministic의 stepper와 동일한 아이디어:
+    - 입력: [B, D] (히스토리: '오래됨→최근' 순서로 평탄화)
+    - k_steps번 자기 예측을 히스토리에 push 하며 진행
+    - 반환: 마지막(=k_steps번째) 예측 z_{t+k}
+    """
+    model.train()  # dropout/BN 일관성 (학습 중)
+    B, D = batch_Z_flat.shape
+    d = model.d
+    nM = model.n_M
+
+    # [B, n_M+1, d]로 복원 (오래됨→최근)
+    hist = batch_Z_flat.view(B, nM + 1, d)
+
+    pred_k = None
+    for _ in range(k_steps):
+        Z_now = hist.view(B, -1)                # [B, D]
+        pred_k = model(Z_now, enable_dropout=True)  # [B, d]
+        # 히스토리 업데이트: 가장 오래된 프레임 제거, 예측을 "최근" 프레임으로 append
+        hist = torch.cat([hist[:, 1:, :], pred_k.unsqueeze(1)], dim=1)
+
+    return pred_k  # [B, d]
+
+
+def create_transfer_training_dataset(all_trajectories, memory_range_NM, n_fut_transfer, selection_mode='random', J0=5):
+    """
+    1-step 학습과 달리, 타겟을 '현재 히스토리의 마지막 시점'으로부터 n_fut_transfer 스텝 뒤로 둔다.
+    (Hist_Deterministic의 Xt_transfer / Xtpdt_transfer 구성과 동일한 오프셋)
+    """
+    Z_list, z_future_list = [], []
+    input_len = memory_range_NM + 1
+    total_len = input_len + n_fut_transfer  # 히스토리 + n_fut 앞 타겟 1개
+
+    choose_starts = []
+    for traj in all_trajectories:
+        max_start = len(traj) - total_len
+        if max_start < 0:  # 샘플이 모자라면 skip
+            continue
+        if selection_mode == 'random':
+            J_i = min(J0, max_start + 1)
+            starts = np.random.choice(max_start + 1, J_i, replace=False)
+        elif selection_mode == 'deterministic':
+            starts = np.arange(max_start + 1)
+        else:
+            raise ValueError(f"Invalid selection mode: {selection_mode}")
+        for start in starts:
+            # 히스토리: [start : start+input_len)  (오래됨→최근)
+            hist = traj[start:start + input_len].reshape(-1)
+            # 타겟: 히스토리 마지막 프레임 기준 n_fut_transfer 스텝 뒤
+            target_idx = start + input_len - 1 + n_fut_transfer
+            z_future = traj[target_idx]
+            Z_list.append(hist)
+            z_future_list.append(z_future)
+
+    Z_tf = np.array(Z_list)
+    z_tf = np.array(z_future_list)
+    print(f"[Transfer] Z_tf.shape = {Z_tf.shape}, z_tf.shape = {z_tf.shape} (n_fut={n_fut_transfer})")
+    return Z_tf, z_tf
+
+
+def train_model_transfer(
+    model, Z_tf, z_tf, n_fut_transfer=5, epochs=30000, lr=1e-4, batch_size=256,
+    normalize=True, clip_grad_norm=0.5, lambda_horizon_sum=0.0
+):
+    """
+    Hist_Deterministic의 'transfer' 단계(PyTorch 버전).
+    - 입력 히스토리를 자기-되먹임으로 n_fut_transfer번 굴려 최종 z_{t+n}을 맞춤
+    - lambda_horizon_sum>0이면, 중간 호라이즌까지의 합산 손실(가중치)도 부여 가능
+    """
+    # 정규화(선택)
+    if normalize:
+        Z_mean = np.mean(Z_tf, axis=0)
+        Z_std  = np.std(Z_tf, axis=0); Z_std = np.where(Z_std == 0, 1.0, Z_std)
+        z_mean = np.mean(z_tf,  axis=0)
+        z_std  = np.std(z_tf,  axis=0); z_std = np.where(z_std == 0, 1.0, z_std)
+        Z_t = torch.tensor((Z_tf - Z_mean) / Z_std, dtype=torch.float32)
+        z_t = torch.tensor((z_tf - z_mean) / z_std, dtype=torch.float32)
+    else:
+        Z_t = torch.tensor(Z_tf, dtype=torch.float32)
+        z_t = torch.tensor(z_tf, dtype=torch.float32)
+
+    dataset = torch.utils.data.TensorDataset(Z_t, z_t)
+    loader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=100, verbose=True)
+
+    model.train()
+    losses = []
+    best = float('inf'); patience=0; max_patience=200
+
+    for ep in range(epochs):
+        ep_loss = 0.0; nb = 0
+        for batch_Z, batch_z_future in loader:
+            optimizer.zero_grad()
+
+            # 최종 시점 loss
+            z_pred_k = _rollout_k_steps_with_model(model, batch_Z, n_fut_transfer)   # [B, d]
+            loss = criterion(z_pred_k, batch_z_future)
+
+            # (옵션) 멀티-호라이즌 합산 손실: lambda_horizon_sum>0이면 켬
+            if lambda_horizon_sum > 0.0:
+                # 1..(n_fut_transfer-1)까지의 예측도 누적(작을수록 가중치↑)
+                B = batch_Z.shape[0]
+                d = model.d; nM = model.n_M
+                hist = batch_Z.view(B, nM + 1, d)
+                gamma = 0.95
+                acc_loss = 0.0; wsum = 0.0
+                for k in range(1, n_fut_transfer):
+                    Z_now = hist.view(B, -1)
+                    z_k = model(Z_now, enable_dropout=True)
+                    hist = torch.cat([hist[:, 1:, :], z_k.unsqueeze(1)], dim=1)
+                    acc_loss = acc_loss + (gamma**(k-1)) * criterion(z_k, batch_z_future)  # proxy: 같은 타깃으로 끌어당김
+                    wsum += (gamma**(k-1))
+                loss = loss + lambda_horizon_sum * (acc_loss / max(wsum, 1e-8))
+
+            # backward
+            loss.backward()
+            if clip_grad_norm and clip_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+            optimizer.step()
+
+            ep_loss += loss.item(); nb += 1
+
+        ep_loss /= nb; losses.append(ep_loss)
+        scheduler.step(ep_loss)
+
+        if ep_loss < best - 1e-8:
+            best = ep_loss; patience = 0
+        else:
+            patience += 1
+
+        if (ep + 1) % 200 == 0:
+            print(f"[Transfer] Epoch {ep+1}/{epochs} | Loss(final@+{n_fut_transfer}): {ep_loss:.6f} | LR {optimizer.param_groups[0]['lr']:.2e}")
+
+        if patience >= max_patience:
+            print(f"[Transfer] Early stopping at epoch {ep+1} (best={best:.6f})")
+            break
+
+    print(f"[Transfer] Done. Final loss: {losses[-1]:.6f}")
+    return losses
+
+
 if __name__ == "__main__":
     # 설정
     hidden_dim = 30
@@ -1552,6 +1791,31 @@ if __name__ == "__main__":
         clip_grad_norm=0.5  # 그래디언트 클리핑
     )
     
+        # === (1) 1-step 학습 완료 후 ===
+    print("\n[+] 1-step training completed.")
+
+    # === (2) Transfer 데이터셋 만들고, n_fut-step ahead로 미세조정 ===
+    n_fut_transfer = 5   # Hist_Deterministic.py의 기본 예
+    Z_tf, z_tf = create_transfer_training_dataset(
+        trajectories, memory_range_NM, n_fut_transfer,
+        selection_mode='random', J0=J0
+    )
+    print(f"Transfer Z/z stats: Z[{Z_tf.min():.4f},{Z_tf.max():.4f}], z[{z_tf.min():.4f},{z_tf.max():.4f}]")
+
+    print("\n[+] Starting transfer learning (self-feeding to +%d steps)..." % n_fut_transfer)
+    transfer_losses = train_model_transfer(
+        model, Z_tf, z_tf,
+        n_fut_transfer=n_fut_transfer,
+        epochs=30000,         # Hist 코드(3만 스텝)와 유사
+        lr=1e-4,              # Hist 코드 1e-4
+        batch_size=256,
+        normalize=True,       # 1-step 때와 동일 정책 유지
+        clip_grad_norm=0.5,
+        lambda_horizon_sum=0.0 # =0이면 Hist와 동일(마지막 시점만 loss); >0이면 멀티-호라이즌 가중
+    )
+
+    # 이후 시뮬레이션/평가 코드는 그대로 사용 (모델 파라미터가 업데이트된 상태)
+
     print("\n[+] Lorenz 96 시스템 학습 완료!")
         
     batch_num = np.random.randint(1, 300)
