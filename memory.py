@@ -9,53 +9,6 @@ import numpy as np
 
 from evaluation import *
 
-class HistoryBuffer:
-    """
-    상태 히스토리를 저장하고 관리하는 클래스
-    """
-    def __init__(self, memory_length, state_dim):
-        self.memory_length = memory_length
-        self.state_dim = state_dim
-        self.buffer = torch.zeros(memory_length, state_dim)
-        self.ptr = 0
-        
-    def update(self, state):
-        """
-        새로운 상태를 버퍼에 추가
-        
-        Args:
-            state (torch.Tensor): 추가할 상태 [state_dim]
-        """
-        self.buffer[self.ptr] = state
-        self.ptr = (self.ptr + 1) % self.memory_length
-        
-    def get_history(self):
-        """
-        시간 순서대로 히스토리 반환 (가장 최근이 마지막)
-        
-        Returns:
-            torch.Tensor: [memory_length, state_dim] 형태의 히스토리
-        """
-        # 시간 순서대로 반환 (가장 오래된 것이 첫 번째)
-        indices = torch.arange(self.memory_length)
-        indices = (self.ptr - indices - 1) % self.memory_length
-        return self.buffer[indices]
-    
-    def get_latest_history(self):
-        """
-        가장 최근 히스토리부터 순서대로 반환 (가장 최근이 첫 번째)
-        
-        Returns:
-            torch.Tensor: [memory_length, state_dim] 형태의 히스토리
-        """
-        indices = torch.arange(self.memory_length)
-        indices = (self.ptr - indices - 1) % self.memory_length
-        return self.buffer[indices].flip(0)  # 시간 순서를 뒤집어서 반환
-    
-    def reset(self):
-        """버퍼를 초기화"""
-        self.buffer.zero_()
-        self.ptr = 0
 
 class dAMZ(nn.Module):
     """
@@ -433,8 +386,6 @@ def train_model(model, Z, z, epochs=2000, lr=1e-3, batch_size=32, normalize=True
     return losses
 
 
-
-
 def _rollout_k_steps_with_model(model, batch_Z_flat, k_steps):
     """
     Hist_Deterministic의 stepper와 동일한 아이디어:
@@ -586,22 +537,26 @@ if __name__ == "__main__":
     epochs = 2000
     J0 = 50
     # 기존에 생성한 Lorenz 96 system dataset 이용
-    print("\n[+] Loading Lorenz 96 system dataset...")
-    results_dir = os.path.join(os.getcwd(), "simulated_data")
-    with open(os.path.join(results_dir, "metadata.json"), "r") as f:
-        metadata = json.load(f)
+    try:
+        print("\n[+] Loading Lorenz 96 system dataset...")
+        results_dir = os.path.join(os.getcwd(), "simulated_data")
+        with open(os.path.join(results_dir, "metadata.json"), "r") as f:
+            metadata = json.load(f)
+    except Exception as e:
+        print(f"Error loading metadata.json: {e}")
+        metadata = {}
 
-    K = metadata['K']
-    J = metadata['J']
-    F = metadata['F']
-    h = metadata['h']
-    b = metadata['b']
-    c = metadata['c']
-    dt = metadata['dt']
-    si = metadata['si']
-    spinup_time = metadata['spinup_time']
-    forecast_time = metadata['forecast_time']
-    num_ic = metadata['num_ic']
+    K = metadata.get('K', 8)
+    J = metadata.get('J', 32)
+    F = metadata.get('F', 15.0)
+    h = metadata.get('h', 1.0)
+    b = metadata.get('b', 10.0)
+    c = metadata.get('c', 10.0)
+    dt = metadata.get('dt', 0.005)
+    si = metadata.get('si', 0.005)
+    spinup_time = metadata.get('spinup_time', 3)
+    forecast_time = metadata.get('forecast_time', 10)
+    num_ic = metadata.get('num_ic', 300)
 
     # 메모리 길이를 더 작게 설정하여 예측 시작점을 앞당김
     memory_length_TM = 0.02
@@ -614,8 +569,8 @@ if __name__ == "__main__":
             X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_coupled_{i}.npy"))
             # X_data shape: (1, time_steps, 8) -> (time_steps, 8)로 변환
             trajectory = X_data[0]  # 첫 번째 배치만 사용
-            trajectory = trajectory[::2,:]
-            trajectory = trajectory + 0.003*np.std(trajectory, axis=0)*torch.randn(trajectory.shape, device=torch.device('cpu')).numpy()
+#            trajectory = trajectory[::2,:]
+#            trajectory = trajectory + 0.003*np.std(trajectory, axis=0)*torch.randn(trajectory.shape, device=torch.device('cpu')).numpy()
             # 데이터 품질 체크
             if np.any(np.isnan(trajectory)) or np.any(np.isinf(trajectory)):
                 print(f"경고: 배치 {i}에서 NaN 또는 Inf 값이 발견되어 건너뜁니다.")
@@ -713,13 +668,8 @@ if __name__ == "__main__":
     # 예측 시작 시간 계산
     prediction_start_time = (memory_range_NM + 1) * dt  # 실제 예측이 시작되는 시간
     
-    # 첫 번째 변수만 시각화
-    t_end = 10
-    '''
-    print("\n--- 첫 번째 변수(X1) 예측 ---")
-    simulate_and_plot_lorenz96_x1_prediction(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
-    '''
     # 모든 변수 시각화
+    t_end = 10
     print("\n--- 모든 변수 예측 ---")
     simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
 
@@ -727,8 +677,10 @@ if __name__ == "__main__":
     # Random IC에 대한 Extrapolation 성능 평가
     print("\n[+] Random IC에 대한 Extrapolation 성능 평가...")
     evaluate_extrapolation_performance(model, metadata, memory_length_TM, num_trials=5, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
-    '''
-    '''
+
+    print("\n--- 첫 번째 변수(X1) 예측 ---")
+    simulate_and_plot_lorenz96_x1_prediction(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
+
     # 불확실성을 포함한 첫 번째 변수 예측
     print("\n--- 첫 번째 변수(X1) 예측 (불확실성 포함) ---")
     simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
