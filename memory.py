@@ -640,8 +640,9 @@ if __name__ == "__main__":
         # === (1) 1-step 학습 완료 후 ===
     print("\n[+] 1-step training completed.")
 
+    '''
     # === (2) Transfer 데이터셋 만들고, n_fut-step ahead로 미세조정 ===
-    n_fut_transfer = 1   # Hist_Deterministic.py의 기본 예
+    n_fut_transfer = 5   # Hist_Deterministic.py의 기본 예
     Z_tf, z_tf = create_transfer_training_dataset(
         trajectories, memory_range_NM, n_fut_transfer,
         selection_mode='random', J0=J0
@@ -659,6 +660,7 @@ if __name__ == "__main__":
         clip_grad_norm=0.5,
         lambda_horizon_sum=0.0 # =0이면 Hist와 동일(마지막 시점만 loss); >0이면 멀티-호라이즌 가중
     )
+    '''
 
     # 이후 시뮬레이션/평가 코드는 그대로 사용 (모델 파라미터가 업데이트된 상태)
 
@@ -676,24 +678,3 @@ if __name__ == "__main__":
     t_end = 10
     print("\n--- 모든 변수 예측 ---")
     simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, memory_length_TM, trajectory_file=f"X_batch_coupled_{batch_num}.npy", t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
-
-    '''
-    # Random IC에 대한 Extrapolation 성능 평가
-    print("\n[+] Random IC에 대한 Extrapolation 성능 평가...")
-    evaluate_extrapolation_performance(model, metadata, memory_length_TM, num_trials=5, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
-
-    print("\n--- 첫 번째 변수(X1) 예측 ---")
-    simulate_and_plot_lorenz96_x1_prediction(model, metadata, memory_length_TM, trajectory_file=f"X_batch_coupled_{batch_num}.npy", t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
-
-    # 불확실성을 포함한 첫 번째 변수 예측
-    print("\n--- 첫 번째 변수(X1) 예측 (불확실성 포함) ---")
-    simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, memory_length_TM, trajectory_file=f"X_batch_coupled_{batch_num}.npy", t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
-
-    # 불확실성을 포함한 모든 변수 시각화
-    print("\n--- 모든 변수 예측 (불확실성 포함) ---")
-    simulate_and_plot_lorenz96_all_variables_prediction_with_uncertainty(model, metadata, memory_length_TM, trajectory_file=f"X_batch_coupled_{batch_num}.npy", t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
-
-    # 불확실성을 포함한 Random IC에 대한 Extrapolation 성능 평가
-    print("\n[+] Random IC에 대한 Extrapolation 성능 평가 (불확실성 포함)...")
-    evaluate_extrapolation_performance_with_uncertainty(model, metadata, memory_length_TM, num_trials=5, t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
-    '''
