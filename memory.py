@@ -534,7 +534,7 @@ def train_model_transfer(
 if __name__ == "__main__":
     # 설정
     hidden_dim = 30
-    epochs = 2000
+    epochs = 15000
     J0 = 50
     # 기존에 생성한 Lorenz 96 system dataset 이용
     try:
@@ -544,6 +544,7 @@ if __name__ == "__main__":
             metadata = json.load(f)
     except Exception as e:
         print(f"Error loading metadata.json: {e}")
+        print("Using default metadata values...")
         metadata = {}
 
     K = metadata.get('K', 8)
@@ -557,6 +558,15 @@ if __name__ == "__main__":
     spinup_time = metadata.get('spinup_time', 3)
     forecast_time = metadata.get('forecast_time', 10)
     num_ic = metadata.get('num_ic', 300)
+    
+    # metadata 딕셔너리에 기본값들을 추가하여 evaluation 함수들이 사용할 수 있도록 함
+    metadata['K'] = K
+    metadata['J'] = J
+    metadata['F'] = F
+    metadata['h'] = h
+    metadata['b'] = b
+    metadata['c'] = c
+    metadata['dt'] = dt
 
     # 메모리 길이를 더 작게 설정하여 예측 시작점을 앞당김
     memory_length_TM = 0.02
@@ -589,7 +599,7 @@ if __name__ == "__main__":
     print(f"로드된 trajectory 수: {len(trajectories)}")            
     print(f"첫 번째 trajectory shape: {trajectories[0].shape}")
     
-    Z, z = create_training_dataset(trajectories, memory_range_NM, selection_mode='deterministic', J0=J0)
+    Z, z = create_training_dataset(trajectories, memory_range_NM, selection_mode='random', J0=J0)
     
     # 데이터 품질 체크
     print(f"Z 데이터 통계: min={Z.min():.4f}, max={Z.max():.4f}, mean={Z.mean():.4f}, std={Z.std():.4f}")
@@ -631,10 +641,10 @@ if __name__ == "__main__":
     print("\n[+] 1-step training completed.")
 
     # === (2) Transfer 데이터셋 만들고, n_fut-step ahead로 미세조정 ===
-    n_fut_transfer = 5   # Hist_Deterministic.py의 기본 예
+    n_fut_transfer = 1   # Hist_Deterministic.py의 기본 예
     Z_tf, z_tf = create_transfer_training_dataset(
         trajectories, memory_range_NM, n_fut_transfer,
-        selection_mode='deterministic', J0=J0
+        selection_mode='random', J0=J0
     )
     print(f"Transfer Z/z stats: Z[{Z_tf.min():.4f},{Z_tf.max():.4f}], z[{z_tf.min():.4f},{z_tf.max():.4f}]")
 
@@ -655,12 +665,6 @@ if __name__ == "__main__":
     print("\n[+] Lorenz 96 시스템 학습 완료!")
         
     batch_num = np.random.randint(1, 300)
-    X_init = np.load(os.path.join(os.getcwd(), "simulated_data", f"ic_X_batch_coupled_{batch_num}.npy"))
-    Y_init = np.load(os.path.join(os.getcwd(), "simulated_data", f"ic_Y_batch_coupled_{batch_num}.npy"))
-    if X_init.ndim == 2:
-        X_init = X_init[0] # shape: [K]
-    if Y_init.ndim == 2:
-        Y_init = Y_init[0] # shape: [K*J]
 
     # 예측 시각화
     print("\n[+] Simulating and plotting prediction vs ground truth...")
@@ -671,7 +675,7 @@ if __name__ == "__main__":
     # 모든 변수 시각화
     t_end = 10
     print("\n--- 모든 변수 예측 ---")
-    simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
+    simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, memory_length_TM, trajectory_file=f"X_batch_coupled_{batch_num}.npy", t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
 
     '''
     # Random IC에 대한 Extrapolation 성능 평가
@@ -679,15 +683,15 @@ if __name__ == "__main__":
     evaluate_extrapolation_performance(model, metadata, memory_length_TM, num_trials=5, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
 
     print("\n--- 첫 번째 변수(X1) 예측 ---")
-    simulate_and_plot_lorenz96_x1_prediction(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
+    simulate_and_plot_lorenz96_x1_prediction(model, metadata, memory_length_TM, trajectory_file=f"X_batch_coupled_{batch_num}.npy", t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
 
     # 불확실성을 포함한 첫 번째 변수 예측
     print("\n--- 첫 번째 변수(X1) 예측 (불확실성 포함) ---")
-    simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
+    simulate_and_plot_lorenz96_x1_prediction_with_uncertainty(model, metadata, memory_length_TM, trajectory_file=f"X_batch_coupled_{batch_num}.npy", t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
 
     # 불확실성을 포함한 모든 변수 시각화
     print("\n--- 모든 변수 예측 (불확실성 포함) ---")
-    simulate_and_plot_lorenz96_all_variables_prediction_with_uncertainty(model, metadata, memory_length_TM, X_init, Y_init, t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
+    simulate_and_plot_lorenz96_all_variables_prediction_with_uncertainty(model, metadata, memory_length_TM, trajectory_file=f"X_batch_coupled_{batch_num}.npy", t_end=t_end, t_start_plot=prediction_start_time, delta=dt, num_mc_samples=100)
 
     # 불확실성을 포함한 Random IC에 대한 Extrapolation 성능 평가
     print("\n[+] Random IC에 대한 Extrapolation 성능 평가 (불확실성 포함)...")
