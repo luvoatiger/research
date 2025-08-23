@@ -1,680 +1,449 @@
-import os
-import sys
-import json
+import numpy as np
+import traceback
+import time
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import traceback
 
-import numpy as np
+from torch.utils.data import DataLoader, Dataset
+from torchdde import integrate, AdaptiveStepSizeController, RK4, Dopri5
+from scipy.integrate import solve_ivp
+from tqdm import tqdm
 
-from evaluation import *
+import os
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class dAMZ(nn.Module):
+def lorenz96_two_scale_rhs(t, state, K=8, J=32, F=10, h=1, b=10, c=10):
     """
-    d-AMZ (discrete Approximated Mori Zwanzig) 신경망
-    논문 Section 3.3의 수식에 따른 구현
-    
-    수정된 버전:
-    - Markov term: Lorenz 96 시스템의 실제 동역학 방정식으로 계산
-    - Memory term: 신경망으로 학습
-    
-    Eq. (13): D = d × (n_M + 1)
-    Eq. (14): Z = (z_n^T, z_{n-1}^T, ..., z_{n-nM}^T)^T ∈ R^D
-    Eq. (15): N(⋅; Θ) : R^D → R^d (memory term만)
-    Eq. (16): z^out = z_n + dt * markov_term + N(Z^in)
-    Eq. (17): z_{n+1} = z_n + dt * markov_term + N(z_n, z_{n-1}, ..., z_{n-nM}; Θ), n ≥ n_M
+    Two-scale Lorenz 96 시스템의 우변 함수
+    state: [X_1, ..., X_K, Y_1, ..., Y_{J*K}]
     """
-
-    def __init__(self, d=3, n_M=60, hidden_dim=30, dropout_rate=0.1, F=8.0, dt=0.005):
-        """
-        dAMZ 신경망 초기화
-
-        Args:
-            d (int): 축소된 변수의 차원 (기본값: 3, x1, x2, x3)
-            n_M (int): 메모리 항목 수 (memory_length_TM / dt)
-            hidden_dim (int): 은닉층 차원
-            dropout_rate (float): dropout 비율 (기본값: 0.1)
-            F (float): Lorenz 96 시스템의 강제력 파라미터 (기본값: 8.0)
-            dt (float): 시간 간격 (기본값: 0.005)
-        """
-        super(dAMZ, self).__init__()
-
-        self.d = d  # 축소된 변수 차원
-        self.n_M = n_M  # 메모리 항목 수
-        self.D = d * (n_M + 1)  # Eq. (13): D = d × (n_M + 1)
-        self.dropout_rate = dropout_rate
-        self.F = F  # Lorenz 96 강제력
-        self.dt = dt  # 시간 간격
-
-        # LSTM 네트워크 N(⋅; Θ) 정의: R^D → R^d (memory term만 학습)
-        # 입력을 시퀀스로 재구성하여 LSTM에 전달
-        self.lstm = nn.LSTM(
-            input_size=d,  # 각 시점의 입력 차원
-            hidden_size=hidden_dim,
-            num_layers=2,
-            batch_first=True,
-            dropout=dropout_rate if 2 > 1 else 0,
-            bidirectional=False
+    X = state[:K]
+    Y = state[K:].reshape(K, J)
+    dXdt = np.zeros(K)
+    dYdt = np.zeros((K, J))
+    # X 방정식
+    for k in range(K):
+        dXdt[k] = (
+            (X[(k+1)%K] - X[k-2]) * X[k-1]
+            - X[k]
+            + F
+            - (h * c / b) * np.sum(Y[k])
         )
-        
-        # LSTM 출력을 최종 차원으로 매핑
-        self.output_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+    # Y 방정식
+    for k in range(K):
+        for j in range(J):
+            dYdt[k, j] = (
+                -c * b * Y[k, j]
+                + (c / b) * (Y[k, (j+1)%J] - Y[k, j-2]) * Y[k, j-1]
+                + (h * c / b) * X[k]
+            )
+    return np.concatenate([dXdt, dYdt.reshape(-1)])
+
+
+class MZMemoryDDE(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, delay_Tau):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.delay_Tau = delay_Tau
+
+        # 입력 차원: 현재 상태 + 과거 상태들
+        total_input_dim = input_dim * (1 + delay_Tau)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(total_input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim // 2, d)
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, output_dim)
         )
 
         # 가중치 초기화
-        self.apply(self._init_weights)
+        self._init_weights()
 
-    def _init_weights(self, module):
-        """가중치 초기화 - 더 안정적인 초기화"""
-        if isinstance(module, nn.Linear):
-            # Xavier 초기화 대신 더 작은 값으로 초기화
-            torch.nn.init.xavier_uniform_(module.weight, gain=0.01)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LSTM):
-            # LSTM 가중치 초기화
-            for name, param in module.named_parameters():
-                if 'weight' in name:
-                    torch.nn.init.xavier_uniform_(param, gain=0.01)
-                elif 'bias' in name:
-                    torch.nn.init.zeros_(param)
+    def _init_weights(self):
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    def lorenz96_markov_term(self, z_n):
+    def forward(self, t, z, history):
+        """
+        Args:
+            t: 현재 시간 (torchdde에서 자동으로 전달)
+            z: 현재 상태 [batch_size, input_dim] (2차원) 또는 [input_dim] (1차원)
+            history: 과거 상태들의 리스트 [x(t-lag_M), x(t-2*lag_M), ..., x(t-delay_Tau*lag_M)]
+        """
+        combined = torch.cat([z, *history], dim=-1)
+        output = self.mlp(combined)
+
+        return output
+
+
+class L96MZNetwork(nn.Module):
+    def __init__(self, K, F, delay_Tau, lag_M, hidden_dim, dt):
+        super().__init__()
+        self.delay_Tau = delay_Tau
+        self.lag_M = lag_M
+        self.K = K
+        self.F = F
+        self.dt = dt
+        # DDE 지연 시간 목록 (초 단위): [lag_M*dt, 2*lag_M*dt, ..., delay_Tau*lag_M*dt]
+        self.delays = torch.tensor([float(i * lag_M * dt) for i in range(1, delay_Tau + 1)], dtype=torch.float32)
+        self.memory_dde = MZMemoryDDE(K, hidden_dim, K, delay_Tau)
+
+    def lorenz_96_markov_term(self, z_n):
         """
         Lorenz 96 시스템의 Markov term 계산
         d/dt X[k] = (X[k+1] - X[k-2]) * X[k-1] - X[k] + F
-        
+
         Args:
             z_n (torch.Tensor): 현재 상태 [batch_size, d]
-            
+
         Returns:
             torch.Tensor: Markov term [batch_size, d]
         """
         batch_size = z_n.shape[0]
-        
+
         # 순환 인덱싱을 위한 roll 연산
         roll_p1 = torch.roll(z_n, shifts=-1, dims=1)  # X[k+1]
         roll_m2 = torch.roll(z_n, shifts=2, dims=1)   # X[k-2]
         roll_m1 = torch.roll(z_n, shifts=1, dims=1)   # X[k-1]
-        
+
         # Lorenz 96 방정식: dX/dt = (X[k+1] - X[k-2]) * X[k-1] - X[k] + F
         markov_term = (roll_p1 - roll_m2) * roll_m1 - z_n + self.F
-        
+
         return markov_term
 
 
-    def forward(self, Z_in, enable_dropout=True):
-        """
-        Forward pass
-        
-        Args:
-            Z_in (torch.Tensor): 입력 텐서 [batch_size, D]
-            enable_dropout (bool): Dropout 활성화 여부
-            
-        Returns:
-            torch.Tensor: 출력 텐서 [batch_size, d]
-        """
-        batch_size = Z_in.shape[0]
-        I_hat = torch.zeros(self.d, self.D)
-        I_hat[:self.d, :self.d] = torch.eye(self.d)
-        I_hat_batch = I_hat.unsqueeze(0).expand(batch_size, -1, -1)
-        Z_in_matrix = Z_in.unsqueeze(2)
-        z_n = torch.bmm(I_hat_batch, Z_in_matrix).squeeze(2)
+    def forward(self, t, z, func_args, *, history):
+        markov_term = self.lorenz_96_markov_term(z)
+        memory_term = self.memory_dde(t, z, history)
 
-        # Euler 적분 사용
-        markov_term = self.lorenz96_markov_term(z_n)
-
-        if enable_dropout:
-            self.lstm.train()
-            self.output_layer.train()
-        else:
-            self.lstm.eval()
-            self.output_layer.eval()
-        
-        # LSTM을 위한 입력 재구성: [batch_size, D] -> [batch_size, n_M+1, d]
-        # Z_in은 [batch_size, D] 형태이고, D = d * (n_M + 1)
-        Z_in_reshaped = Z_in.view(batch_size, self.n_M + 1, self.d)
-        
-        # LSTM 처리
-        lstm_out, _ = self.lstm(Z_in_reshaped)
-        
-        # 마지막 시점의 출력만 사용 (가장 최근 정보)
-        last_output = lstm_out[:, -1, :]  # [batch_size, hidden_dim]
-        
-        # 최종 출력층을 통한 매핑
-        memory_term = self.output_layer(last_output)
-
-        z_out = z_n + self.dt * (markov_term + memory_term)
-
-        return z_out
-
-    def predict_with_uncertainty(self, Z_in, num_samples=100):
-        """
-        Monte Carlo Dropout을 사용한 불확실성 추정
-        
-        Args:
-            Z_in (torch.Tensor): 입력 텐서 [batch_size, D]
-            num_samples (int): Monte Carlo 샘플 수
-            
-        Returns:
-            tuple: (mean_prediction, std_prediction)
-                - mean_prediction: 평균 예측 [batch_size, d]
-                - std_prediction: 예측 표준편차 [batch_size, d]
-        """
-        self.train()
-        
-        predictions = []
-        with torch.no_grad():
-            for _ in range(num_samples):
-                pred = self.forward(Z_in, enable_dropout=True)
-                predictions.append(pred)
-        
-        predictions = torch.stack(predictions, dim=0)
-        mean_prediction = torch.mean(predictions, dim=0)
-        std_prediction = torch.std(predictions, dim=0)
-        
-        return mean_prediction, std_prediction
-
-    def get_memory_structure_info(self):
-        """메모리 구조 정보 반환"""
-        return {
-            'd': self.d,
-            'n_M': self.n_M,
-            'D': self.D,
-            'input_dim': self.D,
-            'output_dim': self.d,
-            'dropout_rate': self.dropout_rate,
-            'F': self.F,
-            'dt': self.dt,
-            'integration_method': 'Euler',
-            'neural_network_type': 'LSTM',
-            'lstm_layers': 2,
-            'lstm_hidden_dim': self.lstm.hidden_size
-        }
+        return markov_term + memory_term
 
 
-def create_training_dataset(all_trajectories, memory_range_NM, selection_mode='random', J0=5):
-    if selection_mode == 'random':
-        return create_random_training_dataset(all_trajectories, memory_range_NM, J0)
-    elif selection_mode == 'deterministic':
-        return create_deterministic_training_dataset(all_trajectories, memory_range_NM)
-    else:
-        raise ValueError(f"Invalid selection mode: {selection_mode}")
+class Lorenz96Dataset(Dataset):
+    def __init__(self, time_axis, trajectory_value):
+        self.ts = time_axis
+        self.ys = trajectory_value
+
+    def __getitem__(self, index):
+        # ✅ 여기서 float32로 고정
+        ts = torch.tensor(self.ts[index], dtype=torch.float32)
+        ys = torch.tensor(self.ys[index], dtype=torch.float32)
+        return ts, ys
+
+    def __len__(self):
+        return self.ys.shape[0]
 
 
-def create_random_training_dataset(all_trajectories, memory_range_NM, J0=5):
-    Z_list, z_list = [], []
-    input_len = memory_range_NM + 1
-    total_len = memory_range_NM + 2
-
-    for traj in all_trajectories:
-        max_start = len(traj) - total_len
-        if max_start < 1:
-            continue
-        J_i = min(J0, max_start)
-        start_indices = np.random.choice(max_start + 1, J_i, replace=False)
-        for start in start_indices:
-            Z_j_i = traj[start:start + input_len].reshape(-1)
-            z_j_i = traj[start + input_len]
-            Z_list.append(Z_j_i)
-            z_list.append(z_j_i)
-
-    Z = np.array(Z_list)
-    z = np.array(z_list)
-    print(f"[Random] Z.shape = {Z.shape}, z.shape = {z.shape}")
-    return Z, z
-
-
-def create_deterministic_training_dataset(all_trajectories, memory_range_NM):
-    Z_list, z_list = [], []
-    input_len = memory_range_NM + 1
-    total_len = memory_range_NM + 2
-
-    for traj in all_trajectories:
-        max_start = len(traj) - total_len
-        if max_start < 1:
-            continue
-        for start in range(max_start + 1):
-            Z_j_i = traj[start:start + input_len].reshape(-1)
-            z_j_i = traj[start + input_len]
-            Z_list.append(Z_j_i)
-            z_list.append(z_j_i)
-
-    Z = np.array(Z_list)
-    z = np.array(z_list)
-    print(f"[Deterministic] Z.shape = {Z.shape}, z.shape = {z.shape}")
-    return Z, z
-
-
-def normalize_data(Z, z):
+def train_neural_dde(model, train_loader, optimizer, criterion, device, dt=0.005, delay_Tau=2, lag_M=2):
     """
-    데이터 정규화 함수
-    
-    Args:
-        Z: 입력 데이터 [N, D]
-        z: 타겟 데이터 [N, d]
-    
-    Returns:
-        Z_norm: 정규화된 입력 데이터
-        z_norm: 정규화된 타겟 데이터
-        Z_mean, Z_std: 입력 데이터의 평균과 표준편차
-        z_mean, z_std: 타겟 데이터의 평균과 표준편차
+    Neural DDE 모델 학습 (배치 단위 처리)
     """
-    # 입력 데이터 정규화
-    Z_mean = np.mean(Z, axis=0)
-    Z_std = np.std(Z, axis=0)
-    Z_std = np.where(Z_std == 0, 1.0, Z_std)  # 표준편차가 0인 경우 1로 설정
-    Z_norm = (Z - Z_mean) / Z_std
-    
-    # 타겟 데이터 정규화
-    z_mean = np.mean(z, axis=0)
-    z_std = np.std(z, axis=0)
-    z_std = np.where(z_std == 0, 1.0, z_std)  # 표준편차가 0인 경우 1로 설정
-    z_norm = (z - z_mean) / z_std
-    
-    print(f"입력 데이터 통계: mean={Z_mean.mean():.4f}, std={Z_std.mean():.4f}")
-    print(f"타겟 데이터 통계: mean={z_mean.mean():.4f}, std={z_std.mean():.4f}")
-    
-    return Z_norm, z_norm, Z_mean, Z_std, z_mean, z_std
-
-
-def train_model(model, Z, z, epochs=2000, lr=1e-3, batch_size=32, normalize=True, clip_grad_norm=1.0):
-    """
-    dAMZ 모델 학습 함수 (배치 처리 포함)
-
-    Args:
-        model: dAMZ 모델
-        Z: 입력 데이터 [N, D]
-        z: 타겟 데이터 [N, d]
-        epochs: 학습 에포크 수
-        lr: 학습률
-        batch_size: 배치 크기
-        normalize: 데이터 정규화 여부
-        clip_grad_norm: 그래디언트 클리핑 값
-    """
-    # 데이터 정규화
-    if normalize:
-        Z_norm, z_norm, Z_mean, Z_std, z_mean, z_std = normalize_data(Z, z)
-        Z_tensor = torch.FloatTensor(Z_norm)
-        z_tensor = torch.FloatTensor(z_norm)
-    else:
-        Z_tensor = torch.FloatTensor(Z)
-        z_tensor = torch.FloatTensor(z)
-
-    # 데이터셋 생성
-    dataset = torch.utils.data.TensorDataset(Z_tensor, z_tensor)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    # 손실 함수와 옵티마이저 정의
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)  # L2 정규화 추가
-    
-    # 학습률 스케줄러 추가
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50, verbose=True)
-
-    # 학습
     model.train()
-    losses = []
-    best_loss = float('inf')
-    patience_counter = 0
-    max_patience = 100
+    total_loss = 0.0
+    num_samples = 0
 
-    for epoch in range(epochs):
-        epoch_loss = 0.0
-        num_batches = 0
+    for batch_idx, (time_series, trajectory_batch) in enumerate(train_loader):
+        delays_vector = torch.as_tensor([(i + 1) * lag_M *dt for i in range(delay_Tau)],
+                                    dtype=time_series.dtype, device=device)
+        # trajectory_batch: (B, time_steps, K) 형태
+        B, time_steps, K = trajectory_batch.shape
 
-        for batch_Z, batch_z in dataloader:
+        # 배치 단위로 데이터를 device로 이동
+        trajectory_batch = trajectory_batch.to(device, dtype=time_series.dtype)  # (B, time_steps, K)
+
+        optimizer.zero_grad()
+        history_indices = [i * lag_M for i in range(delay_Tau + 1)] # 예: [0, 2, 4]
+        history_fn = lambda t: trajectory_batch[:, 0, :].detach()
+
+        # 배치 단위로 integrate 호출
+        solution = integrate(
+            func=model,
+            solver=RK4(),
+            t0=time_series[0, 0],
+            t1=time_series[0, -1],
+            ts=time_series[0],
+            y0=history_fn,
+            func_args=None,
+            stepsize_controller=AdaptiveStepSizeController(rtol=1e-6, atol=1e-8),
+            dt0=time_series[0, 1] - time_series[0, 0],
+            delays=delays_vector,
+            discretize_then_optimize=True)
+
+        assert solution.shape[0] == trajectory_batch.shape[0], f"B mismatch: {solution.shape} vs {trajectory_batch.shape}"
+        assert solution.shape[2] == trajectory_batch.shape[2], f"K mismatch: {solution.shape} vs {trajectory_batch.shape}"
+        assert solution.shape[1] == trajectory_batch.shape[1], (
+            f"time length mismatch: pred T={solution.shape[1]} vs target T={trajectory_batch.shape[1]}. "
+            f"Dataset/target must be (B, T, K). Check your dataset & history_fn."
+        )
+        loss = criterion(solution, trajectory_batch)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        num_samples += B
+
+    return total_loss / num_samples if num_samples > 0 else float("inf")
+
+
+def evaluate_neural_dde(model, test_loader, criterion, device, dt=0.005, delay_Tau=2, lag_M=2):
+    """
+    Neural DDE 모델 평가 (배치 단위 처리)
+    """
+    model.eval()
+    total_loss = 0.0
+    num_samples = 0
+
+
+    with torch.no_grad():
+        for batch_idx, (time_series, trajectory_batch) in enumerate(test_loader):
+            delays_vector = torch.as_tensor([(i + 1) * lag_M *dt for i in range(delay_Tau)],
+                                        dtype=time_series.dtype, device=device)
+            # trajectory_batch: (B, time_steps, K) 형태
+            B, time_steps, K = trajectory_batch.shape
+
+            # 배치 단위로 데이터를 device로 이동
+            trajectory_batch = trajectory_batch.to(device, dtype=torch.float32)  # (B, time_steps, K)
+
+            # delay_Tau=2, lag_M=2일 때 DDE의 초기조건 인덱스는 0
             optimizer.zero_grad()
+            history_indices = [i * lag_M for i in range(delay_Tau + 1)] # 예: [0, 2, 4]
+            history_fn = lambda t: trajectory_batch[:, 0, :].detach()
+            # 배치 단위로 integrate 호출
+            solution = integrate(
+                func=model,
+                solver=RK4(),
+                t0=time_series[0, 0],
+                t1=time_series[0, -1],
+                ts=time_series[0],
+                y0=history_fn,
+                func_args=None,
+                stepsize_controller=AdaptiveStepSizeController(rtol=1e-6, atol=1e-8),
+                dt0=time_series[0, 1] - time_series[0, 0],
+                delays=delays_vector,
+                discretize_then_optimize=True)
+            # ✅ 방어적 점검
+            assert solution.shape[0] == trajectory_batch.shape[0], f"B mismatch: {solution.shape} vs {trajectory_batch.shape}"
+            assert solution.shape[2] == trajectory_batch.shape[2], f"K mismatch: {solution.shape} vs {trajectory_batch.shape}"
+            assert solution.shape[1] == trajectory_batch.shape[1], (
+                f"time length mismatch: pred T={solution.shape[1]} vs target T={trajectory_batch.shape[1]}. "
+                f"Dataset/target must be (B, T, K). Check your dataset & history_fn."
+            )
+            loss = criterion(solution, trajectory_batch)
+            total_loss += loss.item()
+            num_samples += B
 
-            # 순전파
-            outputs = model(batch_Z)
-            loss = criterion(outputs, batch_z)
+    return total_loss / num_samples if num_samples > 0 else float("inf")
 
-            # NaN 체크
-            if torch.isnan(loss):
-                print(f"경고: Epoch {epoch+1}에서 NaN 손실이 발생했습니다!")
-                print(f"입력 데이터 범위: [{batch_Z.min():.4f}, {batch_Z.max():.4f}]")
-                print(f"타겟 데이터 범위: [{batch_z.min():.4f}, {batch_z.max():.4f}]")
-                print(f"출력 데이터 범위: [{outputs.min():.4f}, {outputs.max():.4f}]")
-                return losses
-
-            # 역전파
-            loss.backward()
-            
-            # 그래디언트 클리핑
-            if clip_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
-            
-            # 그래디언트 NaN 체크
-            for name, param in model.named_parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
-                    print(f"경고: {name}에서 NaN 그래디언트가 발생했습니다!")
-                    return losses
-            
-            optimizer.step()
-
-            epoch_loss += loss.item()
-            num_batches += 1
-
-        # 에포크 평균 손실 계산
-        avg_loss = epoch_loss / num_batches
-        losses.append(avg_loss)
-        
-        # 학습률 스케줄러 업데이트
-        scheduler.step(avg_loss)
-        
-        # Early stopping
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            
-        if patience_counter >= max_patience:
-            print(f"Early stopping at epoch {epoch+1}")
-            break
-
-        if (epoch + 1) % 100 == 0:
-            print(f'Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.6f}, LR: {optimizer.param_groups[0]["lr"]:.2e}')
-
-    print(f'Training completed. Final loss: {losses[-1]:.6f}')
-    return losses
-
-
-def _rollout_k_steps_with_model(model, batch_Z_flat, k_steps):
-    """
-    Hist_Deterministic의 stepper와 동일한 아이디어:
-    - 입력: [B, D] (히스토리: '오래됨→최근' 순서로 평탄화)
-    - k_steps번 자기 예측을 히스토리에 push 하며 진행
-    - 반환: 마지막(=k_steps번째) 예측 z_{t+k}
-    """
-    model.train()  # dropout/BN 일관성 (학습 중)
-    B, D = batch_Z_flat.shape
-    d = model.d
-    nM = model.n_M
-
-    # [B, n_M+1, d]로 복원 (오래됨→최근)
-    hist = batch_Z_flat.view(B, nM + 1, d)
-
-    pred_k = None
-    for _ in range(k_steps):
-        Z_now = hist.view(B, -1)                # [B, D]
-        pred_k = model(Z_now, enable_dropout=True)  # [B, d]
-        # 히스토리 업데이트: 가장 오래된 프레임 제거, 예측을 "최근" 프레임으로 append
-        hist = torch.cat([hist[:, 1:, :], pred_k.unsqueeze(1)], dim=1)
-
-    return pred_k  # [B, d]
-
-
-def create_transfer_training_dataset(all_trajectories, memory_range_NM, n_fut_transfer, selection_mode='random', J0=5):
-    """
-    1-step 학습과 달리, 타겟을 '현재 히스토리의 마지막 시점'으로부터 n_fut_transfer 스텝 뒤로 둔다.
-    (Hist_Deterministic의 Xt_transfer / Xtpdt_transfer 구성과 동일한 오프셋)
-    """
-    Z_list, z_future_list = [], []
-    input_len = memory_range_NM + 1
-    total_len = input_len + n_fut_transfer  # 히스토리 + n_fut 앞 타겟 1개
-
-    choose_starts = []
-    for traj in all_trajectories:
-        max_start = len(traj) - total_len
-        if max_start < 0:  # 샘플이 모자라면 skip
-            continue
-        if selection_mode == 'random':
-            J_i = min(J0, max_start + 1)
-            starts = np.random.choice(max_start + 1, J_i, replace=False)
-        elif selection_mode == 'deterministic':
-            starts = np.arange(max_start + 1)
-        else:
-            raise ValueError(f"Invalid selection mode: {selection_mode}")
-        for start in starts:
-            # 히스토리: [start : start+input_len)  (오래됨→최근)
-            hist = traj[start:start + input_len].reshape(-1)
-            # 타겟: 히스토리 마지막 프레임 기준 n_fut_transfer 스텝 뒤
-            target_idx = start + input_len - 1 + n_fut_transfer
-            z_future = traj[target_idx]
-            Z_list.append(hist)
-            z_future_list.append(z_future)
-
-    Z_tf = np.array(Z_list)
-    z_tf = np.array(z_future_list)
-    print(f"[Transfer] Z_tf.shape = {Z_tf.shape}, z_tf.shape = {z_tf.shape} (n_fut={n_fut_transfer})")
-    return Z_tf, z_tf
-
-
-def train_model_transfer(
-    model, Z_tf, z_tf, n_fut_transfer=5, epochs=30000, lr=1e-4, batch_size=256,
-    normalize=True, clip_grad_norm=0.5, lambda_horizon_sum=0.0
-):
-    """
-    Hist_Deterministic의 'transfer' 단계(PyTorch 버전).
-    - 입력 히스토리를 자기-되먹임으로 n_fut_transfer번 굴려 최종 z_{t+n}을 맞춤
-    - lambda_horizon_sum>0이면, 중간 호라이즌까지의 합산 손실(가중치)도 부여 가능
-    """
-    # 정규화(선택)
-    if normalize:
-        Z_mean = np.mean(Z_tf, axis=0)
-        Z_std  = np.std(Z_tf, axis=0); Z_std = np.where(Z_std == 0, 1.0, Z_std)
-        z_mean = np.mean(z_tf,  axis=0)
-        z_std  = np.std(z_tf,  axis=0); z_std = np.where(z_std == 0, 1.0, z_std)
-        Z_t = torch.tensor((Z_tf - Z_mean) / Z_std, dtype=torch.float32)
-        z_t = torch.tensor((z_tf - z_mean) / z_std, dtype=torch.float32)
-    else:
-        Z_t = torch.tensor(Z_tf, dtype=torch.float32)
-        z_t = torch.tensor(z_tf, dtype=torch.float32)
-
-    dataset = torch.utils.data.TensorDataset(Z_t, z_t)
-    loader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=100, verbose=True)
-
-    model.train()
-    losses = []
-    best = float('inf'); patience=0; max_patience=200
-
-    for ep in range(epochs):
-        ep_loss = 0.0; nb = 0
-        for batch_Z, batch_z_future in loader:
-            optimizer.zero_grad()
-
-            # 최종 시점 loss
-            z_pred_k = _rollout_k_steps_with_model(model, batch_Z, n_fut_transfer)   # [B, d]
-            loss = criterion(z_pred_k, batch_z_future)
-
-            # (옵션) 멀티-호라이즌 합산 손실: lambda_horizon_sum>0이면 켬
-            if lambda_horizon_sum > 0.0:
-                # 1..(n_fut_transfer-1)까지의 예측도 누적(작을수록 가중치↑)
-                B = batch_Z.shape[0]
-                d = model.d; nM = model.n_M
-                hist = batch_Z.view(B, nM + 1, d)
-                gamma = 0.95
-                acc_loss = 0.0; wsum = 0.0
-                for k in range(1, n_fut_transfer):
-                    Z_now = hist.view(B, -1)
-                    z_k = model(Z_now, enable_dropout=True)
-                    hist = torch.cat([hist[:, 1:, :], z_k.unsqueeze(1)], dim=1)
-                    acc_loss = acc_loss + (gamma**(k-1)) * criterion(z_k, batch_z_future)  # proxy: 같은 타깃으로 끌어당김
-                    wsum += (gamma**(k-1))
-                loss = loss + lambda_horizon_sum * (acc_loss / max(wsum, 1e-8))
-
-            # backward
-            loss.backward()
-            if clip_grad_norm and clip_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
-            optimizer.step()
-
-            ep_loss += loss.item(); nb += 1
-
-        ep_loss /= nb; losses.append(ep_loss)
-        scheduler.step(ep_loss)
-
-        if ep_loss < best - 1e-8:
-            best = ep_loss; patience = 0
-        else:
-            patience += 1
-
-        if (ep + 1) % 200 == 0:
-            print(f"[Transfer] Epoch {ep+1}/{epochs} | Loss(final@+{n_fut_transfer}): {ep_loss:.6f} | LR {optimizer.param_groups[0]['lr']:.2e}")
-
-        if patience >= max_patience:
-            print(f"[Transfer] Early stopping at epoch {ep+1} (best={best:.6f})")
-            break
-
-    print(f"[Transfer] Done. Final loss: {losses[-1]:.6f}")
-    return losses
 
 
 if __name__ == "__main__":
-    # 설정
-    hidden_dim = 30
-    epochs = 15000
-    J0 = 50
-    # 기존에 생성한 Lorenz 96 system dataset 이용
-    try:
-        print("\n[+] Loading Lorenz 96 system dataset...")
-        results_dir = os.path.join(os.getcwd(), "simulated_data")
-        with open(os.path.join(results_dir, "metadata.json"), "r") as f:
-            metadata = json.load(f)
-    except Exception as e:
-        print(f"Error loading metadata.json: {e}")
-        print("Using default metadata values...")
-        metadata = {}
+    # torchdde API 테스트    # 하이퍼파라미터
+    dt=0.005
+    batch_size = 64  # Neural DDE는 메모리 사용량이 많아서 작게 설정
+    lr = 0.001
+    max_epoch = 100
+    delay_Tau = torch.nn.Parameter(torch.tensor(2))
+    lag_M = 1
+    K = 8  # X 변수 개수
+    F = 15  # Lorenz 96 파라미터
+    hidden_dim = 128
 
-    K = metadata.get('K', 8)
-    J = metadata.get('J', 32)
-    F = metadata.get('F', 15.0)
-    h = metadata.get('h', 1.0)
-    b = metadata.get('b', 10.0)
-    c = metadata.get('c', 10.0)
-    dt = metadata.get('dt', 0.005)
-    si = metadata.get('si', 0.005)
-    spinup_time = metadata.get('spinup_time', 3)
-    forecast_time = metadata.get('forecast_time', 10)
-    num_ic = metadata.get('num_ic', 300)
-    
-    # metadata 딕셔너리에 기본값들을 추가하여 evaluation 함수들이 사용할 수 있도록 함
-    metadata['K'] = K
-    metadata['J'] = J
-    metadata['F'] = F
-    metadata['h'] = h
-    metadata['b'] = b
-    metadata['c'] = c
-    metadata['dt'] = dt
+    print(f"=== Neural DDE for Lorenz 96 System ===")
+    print(f"delay_Tau: {delay_Tau} (과거 {delay_Tau}개 데이터 사용)")
+    print(f"lag_M: {lag_M} (데이터 간격: {lag_M}*dt)")
+    print(f"K: {K} (X 변수 개수)")
+    print(f"F: {F} (강제 항)")
+    print(f"Device: {device}")
 
-    # 메모리 길이를 더 작게 설정하여 예측 시작점을 앞당김
-    memory_length_TM = 0.02
-    memory_range_NM = int(memory_length_TM / dt)
-    
-    # 데이터 로드 및 전처리
+    # 데이터 생성
+    print("\n[+] Trajectory 생성 중...")
+
+    # 여러 개의 trajectory 생성 (여기서는 5개 생성)
+    num_trajectories = 5
     trajectories = []
-    for i in range(1, min(num_ic + 1, 51)):  # 처음 50개만 사용하여 메모리 절약
-        try:
-            X_data = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_coupled_{i}.npy"))
-            # X_data shape: (1, time_steps, 8) -> (time_steps, 8)로 변환
-            trajectory = X_data[0]  # 첫 번째 배치만 사용
-#            trajectory = trajectory[::2,:]
-#            trajectory = trajectory + 0.003*np.std(trajectory, axis=0)*torch.randn(trajectory.shape, device=torch.device('cpu')).numpy()
-            # 데이터 품질 체크
-            if np.any(np.isnan(trajectory)) or np.any(np.isinf(trajectory)):
-                print(f"경고: 배치 {i}에서 NaN 또는 Inf 값이 발견되어 건너뜁니다.")
-                continue
-                
-            # 극단적인 값 필터링
-            if np.any(np.abs(trajectory) > 1000):
-                print(f"경고: 배치 {i}에서 극단적인 값이 발견되어 건너뜁니다.")
-                continue
-                
-            trajectories.append(trajectory)
-        except Exception as e:
-            print(f"배치 {i} 로드 중 오류: {e}")
-            continue
+    time_list = []
+    for i in range(1, 1+num_trajectories):
+        # 각각 다른 초기값으로 trajectory 생성
+        traj_i = np.load(os.path.join(os.getcwd(), "simulated_data", f"X_batch_coupled_{i}.npy"))[0]
+        t_i = np.load(os.path.join(os.getcwd(), "simulated_data", f"t_batch_coupled_{i}.npy"))[0]
+        if t_i[0] != 0:
+            t_i = t_i - t_i[0]
+        # traj_i의 실제 shape에 따라 안전 변환
+        # 기대 형태: 최종적으로 X_traj_i는 (T, K)
+        if traj_i.ndim == 2:
+            if traj_i.shape[0] == K:         # (K, T)인 경우
+                X_traj_i = traj_i[:K, :].T   # -> (T, K)
+            elif traj_i.shape[1] == K:       # (T, K)인 경우
+                X_traj_i = traj_i[:, :K]     # -> (T, K)
+            else:
+                raise ValueError(f"traj_i shape={traj_i.shape}, cannot infer (T,K).")
+        else:
+            raise ValueError(f"traj_i ndim={traj_i.ndim}, expected 2D array.")
+        print(X_traj_i.shape)
+        print(t_i.shape)
+        trajectories.append(X_traj_i)
+        time_list.append(t_i)
 
-    print(f"로드된 trajectory 수: {len(trajectories)}")            
-    print(f"첫 번째 trajectory shape: {trajectories[0].shape}")
-    
-    Z, z = create_training_dataset(trajectories, memory_range_NM, selection_mode='random', J0=J0)
-    
-    # 데이터 품질 체크
-    print(f"Z 데이터 통계: min={Z.min():.4f}, max={Z.max():.4f}, mean={Z.mean():.4f}, std={Z.std():.4f}")
-    print(f"z 데이터 통계: min={z.min():.4f}, max={z.max():.4f}, mean={z.mean():.4f}, std={z.std():.4f}")
-    
-    if np.any(np.isnan(Z)) or np.any(np.isnan(z)):
-        print("오류: 학습 데이터에 NaN 값이 포함되어 있습니다!")
-        sys.exit(1)
+    # 모든 trajectory를 하나의 배열로 합치기
+    trajectories = np.array(trajectories)  # [num_trajectories, time_steps, K]
+    time_list = np.array(time_list)
+    print(f"Trajectories shape: {trajectories.shape}")
 
-    # Lorenz 96 시스템에 맞는 모델 생성 (Monte Carlo Dropout 포함)
-    reduced_order_d = K  # Lorenz 96 시스템의 변수 수
-    dropout_rate = 0.1  # dropout 비율
-    print(f"모델 생성 시작: reduced_order_d={reduced_order_d}, n_M={memory_range_NM}, hidden_dim={hidden_dim}, dropout_rate={dropout_rate}")
-    model = dAMZ(d=reduced_order_d, n_M=memory_range_NM, hidden_dim=hidden_dim, dropout_rate=dropout_rate)
-    print("모델 생성 완료")
-    
-    # 모델 구조 정보 출력
-    model_info = model.get_memory_structure_info()
-    print(f"\n[+] dAMZ 모델 구조 (Lorenz 96):")
-    print(f"  - 축소된 변수 차원 (d): {model_info['d']}")
-    print(f"  - 메모리 항목 수 (n_M): {model_info['n_M']}")
-    print(f"  - 입력 차원 (D): {model_info['D']}")
-    print(f"  - 출력 차원: {model_info['output_dim']}")
-    print(f"  - 실제 입력 데이터 shape: {Z.shape}")
-    print(f"  - 실제 출력 데이터 shape: {z.shape}")
+    # 데이터셋 생성
+    print(f"\n[+] 데이터셋 생성 중...")
+    dataset = Lorenz96Dataset(time_list, trajectories)
+    print(f"데이터셋 크기: {len(dataset)}")
 
-    print("\n[+] Training model...")
-    # 더 안정적인 학습 파라미터 사용
-    losses = train_model(
-        model, Z, z, 
-        epochs=epochs, 
-        lr=5e-4,  # 더 작은 학습률
-        batch_size=256,  # 더 작은 배치 크기
-        normalize=True,  # 데이터 정규화 활성화
-        clip_grad_norm=0.5  # 그래디언트 클리핑
+    # 학습/검증 분할 (trajectory 기반 분할)
+    # trajectories.shape = (num_trajectories, time_steps, K)이므로
+    # num_trajectories로 분할해야 함
+    num_trajectories = trajectories.shape[0]
+    train_size = int(0.8 * num_trajectories)
+    val_size = num_trajectories - train_size
+
+    train_indices = list(range(train_size))
+    val_indices = list(range(train_size, num_trajectories))
+
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(dataset, val_indices)
+
+    # --- (2) DataLoader(선택적) 성능 옵션 ---
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        pin_memory=(device.type == "cuda"), num_workers=2, drop_last=False
     )
-    
-        # === (1) 1-step 학습 완료 후 ===
-    print("\n[+] 1-step training completed.")
-
-    '''
-    # === (2) Transfer 데이터셋 만들고, n_fut-step ahead로 미세조정 ===
-    n_fut_transfer = 5   # Hist_Deterministic.py의 기본 예
-    Z_tf, z_tf = create_transfer_training_dataset(
-        trajectories, memory_range_NM, n_fut_transfer,
-        selection_mode='random', J0=J0
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        pin_memory=(device.type == "cuda"), num_workers=2, drop_last=False
     )
-    print(f"Transfer Z/z stats: Z[{Z_tf.min():.4f},{Z_tf.max():.4f}], z[{z_tf.min():.4f},{z_tf.max():.4f}]")
+    print(f"학습 데이터: {len(train_dataset)}, 검증 데이터: {len(val_dataset)}")
 
-    print("\n[+] Starting transfer learning (self-feeding to +%d steps)..." % n_fut_transfer)
-    transfer_losses = train_model_transfer(
-        model, Z_tf, z_tf,
-        n_fut_transfer=n_fut_transfer,
-        epochs=30000,         # Hist 코드(3만 스텝)와 유사
-        lr=1e-4,              # Hist 코드 1e-4
-        batch_size=256,
-        normalize=True,       # 1-step 때와 동일 정책 유지
-        clip_grad_norm=0.5,
-        lambda_horizon_sum=0.0 # =0이면 Hist와 동일(마지막 시점만 loss); >0이면 멀티-호라이즌 가중
-    )
-    '''
+    # 모델 초기화
+    print(f"\n[+] 모델 초기화 중...")
+    model = L96MZNetwork(K, F, delay_Tau, lag_M, hidden_dim, 0.005).to(device)
+    print(f"모델 파라미터 수: {sum(p.numel() for p in model.parameters())}")
 
-    # 이후 시뮬레이션/평가 코드는 그대로 사용 (모델 파라미터가 업데이트된 상태)
+    # 손실 함수 및 옵티마이저
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
-    print("\n[+] Lorenz 96 시스템 학습 완료!")
-        
-    batch_num = np.random.randint(1, 300)
+    # 학습 루프
+    print(f"\n[+] 학습 시작...")
+    print(f"AdaptiveStepSizeController 설정:")
+    print(f"  - rtol: 1e-6 (상대 오차 허용치)")
+    print(f"  - atol: 1e-8 (절대 오차 허용치)")
 
-    # 예측 시각화
-    print("\n[+] Simulating and plotting prediction vs ground truth...")
-    
-    # 예측 시작 시간 계산
-    prediction_start_time = (memory_range_NM + 1) * dt  # 실제 예측이 시작되는 시간
-    
-    # 모든 변수 시각화
-    t_end = 10
-    print("\n--- 모든 변수 예측 ---")
-    simulate_and_plot_lorenz96_all_variables_prediction(model, metadata, memory_length_TM, trajectory_file=f"X_batch_coupled_{batch_num}.npy", t_end=t_end, t_start_plot=prediction_start_time, delta=dt)
+    train_losses = []
+    val_losses = []
+
+    for epoch in tqdm(range(max_epoch)):
+        start_time = time.time()
+
+        # 학습
+        train_loss = train_neural_dde(model, train_loader, optimizer, criterion, device, dt, delay_Tau, lag_M)
+
+        # 검증
+        val_loss = evaluate_neural_dde(model, val_loader, criterion, device, dt, delay_Tau, lag_M)
+
+        # 학습률 조정
+        scheduler.step(val_loss)
+
+        # 결과 저장
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+        epoch_time = time.time() - start_time
+
+        print(f"Epoch {epoch+1}/{max_epoch}: "
+              f"Train Loss = {train_loss:.6f}, "
+              f"Val Loss = {val_loss:.6f}, "
+              f"Time = {epoch_time:.2f}s")
+
+
+        # 조기 종료 체크
+        if val_loss < 1e-6:
+            print("검증 손실이 충분히 작아졌습니다. 학습을 종료합니다.")
+            break
+
+    # 학습 결과 시각화
+    print(f"\n[+] 학습 결과 시각화...")
+    print(f"시각화할 데이터 - train_losses: {train_losses}")
+    print(f"시각화할 데이터 - val_losses: {val_losses}")
+
+    if len(train_losses) == 0 or len(val_losses) == 0:
+        print("경고: loss 데이터가 없습니다. 그래프를 그릴 수 없습니다.")
+    else:
+        plt.figure(figsize=(12, 4))
+
+        plt.subplot(1, 2, 1)
+        epochs = list(range(1, len(train_losses) + 1))  # 1부터 시작하는 epoch 번호
+        plt.plot(epochs, train_losses, 'b-', label='Train Loss', linewidth=2)
+        plt.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training Progress')
+        plt.legend()
+        plt.yscale('log')
+        plt.grid(True)
+        plt.xlim(0.5, len(train_losses) + 0.5)  # X축 범위 명시적 설정
+
+        plt.subplot(1, 2, 2)
+        # 최근 20개 데이터만 표시 (데이터가 20개 미만이면 전체 표시)
+        recent_train = train_losses[-20:] if len(train_losses) >= 20 else train_losses
+        recent_val = val_losses[-20:] if len(val_losses) >= 20 else val_losses
+
+        # 최근 데이터에 대한 epoch 번호 계산
+        if len(train_losses) >= 20:
+            recent_epochs = list(range(len(train_losses) - 19, len(train_losses) + 1))
+        else:
+            recent_epochs = list(range(1, len(train_losses) + 1))
+
+        plt.plot(recent_epochs, recent_train, 'b-', label=f'Train Loss (Last {len(recent_train)})', linewidth=2)
+        plt.plot(recent_epochs, recent_val, 'r-', label=f'Validation Loss (Last {len(recent_val)})', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Recent Training Progress')
+        plt.legend()
+        plt.yscale('log')
+        plt.grid(True)
+        plt.xlim(min(recent_epochs) - 0.5, max(recent_epochs) + 0.5)  # X축 범위 명시적 설정
+
+        plt.tight_layout()
+        plt.show()
+
+    print(f"\n=== 학습 완료 ===")
+    print(f"최종 학습 손실: {train_losses[-1]:.6f}")
+    print(f"최종 검증 손실: {val_losses[-1]:.6f}")
+
+    # 모델 저장
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'hyperparameters': {
+            'delay_Tau': delay_Tau,
+            'lag_M': lag_M,
+            'K': K,
+            'F': F,
+            'hidden_dim': hidden_dim
+        }
+    }, 'lorenz96_neural_dde_model.pth')
+
+    print(f"모델이 'lorenz96_neural_dde_model.pth'에 저장되었습니다.")
