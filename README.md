@@ -1,4 +1,4 @@
-# Research Project: Lorenz 96 System with dAMZ Neural Network
+# Neural Ordinary Differential Equations with Explicit Mori-Zwanzig Decomposition for Multiscale Atmospheric Modeling : Application to Lorenz 96 System
 
 ## 프로젝트 개요
 이 프로젝트는 Lorenz 96 시스템을 dAMZ (discrete Approximated Mori Zwanzig) 신경망으로 모델링하고, 기후 예측 모델의 성능을 다양한 지표로 평가하는 연구입니다.
